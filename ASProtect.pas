@@ -2,7 +2,7 @@ unit ASProtect;
 
 interface
 
-uses Windows, Classes, DebuggerCore, SysUtils, Generics.Collections;
+uses Windows, Classes, DebuggerCore, SysUtils, Generics.Collections, Utils, RolyPoly;
 
 type
   TASDebugger = class(TDebuggerCore)
@@ -21,7 +21,9 @@ type
     FProcRevealEvent: THandle;
     FProcAddr: Pointer;
     FProcIsJmp: Boolean;
-    FSomeStolenFailed: Boolean;
+
+    FRolyPoly: TRolyPoly;
+    FPolyCode: TList<TFixedPolyCode>;
 
     FOEP: NativeUInt;
 
@@ -59,7 +61,7 @@ type
 
 implementation
 
-uses Utils, Dumper, Patcher, RestoreLibCode;
+uses Dumper, Patcher, RestoreLibCode;
 
 {$POINTERMATH ON}
 
@@ -68,6 +70,7 @@ uses Utils, Dumper, Patcher, RestoreLibCode;
 destructor TASDebugger.Destroy;
 begin
   FGuardAddrs.Free;
+  FPolyCode.Free;
 
   inherited;
 end;
@@ -79,6 +82,8 @@ var
   i: Integer;
   NumRead: Cardinal;
 begin
+  FPolyCode := TObjectList<TFixedPolyCode>.Create;
+
   if (hPE = 0) or (hPE = INVALID_HANDLE_VALUE) then
   begin
     hPE := CreateFile(PChar(FExecutable), GENERIC_READ, FILE_SHARE_READ, nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
@@ -169,6 +174,9 @@ var
   OldProt: Cardinal;
   i: Integer;
 begin
+  if FRolyPoly <> nil then
+    Exit(FRolyPoly.OnAccessViolation(hThread, ExcRecord));
+
   if FGetProcResultAddr <> 0 then
   begin
     inherited;
@@ -357,6 +365,7 @@ begin
   FN := ExtractFilePath(FExecutable) + ChangeFileExt(ExtractFileName(FExecutable), 'U' + ExtractFileExt(FExecutable));
   with TDumper.Create(FProcess, FImageBase, FOEP, FImageBase + FBaseOfData) do
   begin
+    PolyCode := FPolyCode;
     DumpToFile(FN, Process());
     Free;
   end;
@@ -369,10 +378,7 @@ begin
 
   FHideThreadEnd := True;
   TerminateProcess(FProcess.hProcess, 0);
-  if FSomeStolenFailed then
-    Log(ltFatal, 'A dump was created, but some stolen code was not recovered. Check log above.')
-  else
-    Log(ltGood, 'Operation completed successfully.');
+  Log(ltGood, 'Operation completed successfully.');
 end;
 
 procedure TASDebugger.InitTracing;
@@ -421,7 +427,7 @@ end;
 procedure TASTracer.Execute;
 var
   i: Integer;
-  IAT, SiteAddr, Target, NumWritten: NativeUInt;
+  IAT, SiteAddr, Target, SiteTarget, NumWritten: NativeUInt;
   SiteSet: TList<NativeUInt>;
   Site: array[0..5] of Byte;
   IsJmp: Boolean;
@@ -458,34 +464,42 @@ begin
 
     if not FDebugger.RPM(SiteAddr, @Site, 6) then
       RaiseLastOSError;
+
     if Site[0] = $E8 then // TODO should check if PCardinal(@Site[1]) is mapped in case this is in fact the case below with an unfortunate byte in front
     begin
       //Target := PCardinal(@Site[1])^ + SiteAddr + 5;
       Target := DoTrace(SiteAddr);
       IsJmp := FDebugger.FProcIsJmp;
     end
-    else if (Site[1] = $E9) then
+    else if (Site[1] = $E9) or (Site[1] = $68) then
     begin
-      Log(ltInfo, Format('Stolen: JMP at %X -> %X', [SiteAddr + 1, PCardinal(@Site[2])^ + SiteAddr + 6]));
+      if Site[1] = $E9 then
+      begin
+        SiteTarget := PCardinal(@Site[2])^ + SiteAddr + 6;
+        Log(ltInfo, Format('Stolen: JMP at %X -> %X', [SiteAddr + 1, SiteTarget]));
+      end
+      else
+      begin
+        SiteTarget := PCardinal(@Site[2])^;
+        Log(ltInfo, Format('Stolen: PUSH at %X -> %X', [SiteAddr + 1, SiteTarget]));
+      end;
 
-      StolenData := GetStolenCode(SiteAddr + 1, PCardinal(@Site[2])^ + SiteAddr + 6, FDebugger.RPM);
+      if SiteTarget and $FFF <> 0 then
+      begin
+        Log(ltInfo, '(skipping)');
+        Continue;
+      end;
+
+      StolenData := GetStolenCode(SiteAddr + 1, SiteTarget, FDebugger.RPM);
       if StolenData <> nil then
         WriteProcessMemory(FDebugger.FProcess.hProcess, Pointer(SiteAddr + 1), @StolenData[0], Length(StolenData), NumWritten)
       else
-        FDebugger.FSomeStolenFailed := True;
-
-      LastExtent := SiteAddr + 1 + Cardinal(Length(StolenData));
-      Continue;
-    end
-    else if (Site[1] = $68) then
-    begin
-      Log(ltInfo, Format('Stolen: PUSH at %X -> %X', [SiteAddr + 1, PCardinal(@Site[2])^]));
-
-      StolenData := GetStolenCode(SiteAddr + 1, PCardinal(@Site[2])^, FDebugger.RPM);
-      if StolenData <> nil then
-        WriteProcessMemory(FDebugger.FProcess.hProcess, Pointer(SiteAddr + 1), @StolenData[0], Length(StolenData), NumWritten)
-      else
-        FDebugger.FSomeStolenFailed := True;
+      begin
+        FDebugger.FRolyPoly := TRolyPoly.Create(FDebugger.FProcess.hProcess, FTraceThread, SiteTarget, FDebugger.FASRegion, Log);
+        FDebugger.FPolyCode.Add(FDebugger.FRolyPoly.Run);
+        FDebugger.FPolyCode.Last.Origin := SiteAddr + 1;
+        FreeAndNil(FDebugger.FRolyPoly);
+      end;
 
       LastExtent := SiteAddr + 1 + Cardinal(Length(StolenData));
       Continue;

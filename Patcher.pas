@@ -24,7 +24,7 @@ type
 
 implementation
 
-uses Unit2, DebuggerCore;
+uses Unit2, Utils, DebuggerCore;
 
 { TPatcher }
 
@@ -225,7 +225,8 @@ begin
   NS.CopyFrom(FStream, PE.Sections[0].Header.PointerToRawData);
   for i := 0 to High(PE.Sections) do
   begin
-    if not IsReferenced(PE.Sections[i].Header) and (PAnsiChar(@PE.Sections[i].Header.Name) <> '.data') and (i > 0) then
+    if not IsReferenced(PE.Sections[i].Header) and (i > 0) and (PAnsiChar(@PE.Sections[i].Header.Name) <> '.data')
+       and (PAnsiChar(@PE.Sections[i].Header.Name) <> '.poly') then
     begin
       Del.Add(i);
       if i <> High(PE.Sections) then

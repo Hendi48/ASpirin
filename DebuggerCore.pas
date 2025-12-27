@@ -3,12 +3,9 @@ unit DebuggerCore;
 interface
 
 uses
-  Windows, Classes, SysUtils, Generics.Collections;
+  Windows, Classes, SysUtils, Generics.Collections, Utils;
 
 type
-  TLogMsgType = (ltInfo, ltGood, ltFatal);
-  TLogProc = procedure(MsgType: TLogMsgType; const Msg: string) of object;
-
   THWBPType = (hwExecute, hwWrite, hwReserved, hwAccess);
 
   TBreakpoint = record
@@ -18,13 +15,6 @@ type
 
     procedure Change(AAddress: NativeUInt; AType: THWBPType);
     function IsSet: Boolean;
-  end;
-
-  TMemoryRegion = record
-    Address: NativeUInt;
-    Size: Cardinal;
-
-    function Contains(AAddress: NativeUInt): Boolean;
   end;
 
   TDebuggerCore = class abstract(TThread)
@@ -74,8 +64,6 @@ type
   end;
 
 implementation
-
-uses Utils;
 
 { TDebugger }
 
@@ -590,13 +578,6 @@ end;
 function TBreakpoint.IsSet: Boolean;
 begin
   Result := not Disabled and (Address > 0);
-end;
-
-{ TMemoryRegion }
-
-function TMemoryRegion.Contains(AAddress: NativeUInt): Boolean;
-begin
-  Result := (AAddress >= Address) and (AAddress < Address + Size);
 end;
 
 end.

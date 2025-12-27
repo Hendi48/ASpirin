@@ -2,7 +2,7 @@ unit Dumper;
 
 interface
 
-uses Windows, SysUtils, Classes, Generics.Collections, TlHelp32, PEInfo;
+uses Windows, SysUtils, Classes, Generics.Collections, TlHelp32, PEInfo, RolyPoly;
 
 type
   TExportTable = TDictionary<Pointer, string>;
@@ -26,6 +26,8 @@ type
     FIATImage: PByte;
     FIATImageSize: Cardinal;
 
+    FPolyCode: TList<TFixedPolyCode>;
+
     FUsrPath: PChar;
     FHUsr: HMODULE;
 
@@ -34,17 +36,21 @@ type
     procedure GatherModuleExportsFromRemoteProcess(M: PRemoteModule);
     function GetLocalProcAddr(hModule: HMODULE; ProcName: PAnsiChar): Pointer;
     function RPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
+
+    procedure CreatePolySection(PE: TPEHeader);
   public
     constructor Create(const AProcess: TProcessInformation; AImageBase, AOEP, AIAT: NativeUInt);
     destructor Destroy; override;
 
     function Process: TPEHeader;
     procedure DumpToFile(const FileName: string; PE: TPEHeader);
+
+    property PolyCode: TList<TFixedPolyCode> read FPolyCode write FPolyCode;
   end;
 
 implementation
 
-uses Unit2, DebuggerCore;
+uses Unit2, Utils, DebuggerCore;
 
 { TDumper }
 
@@ -345,6 +351,9 @@ begin
   FIATImage := IAT;
   FIATImageSize := IATSize;
 
+  if (FPolyCode <> nil) and (FPolyCode.Count > 0) then
+    CreatePolySection(PE);
+
   Result := PE;
 end;
 
@@ -406,6 +415,44 @@ end;
 function TDumper.RPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
 begin
   Result := ReadProcessMemory(FProcess.hProcess, Pointer(Address), Buf, BufSize, BufSize);
+end;
+
+procedure TDumper.CreatePolySection(PE: TPEHeader);
+var
+  SectSize: UInt32;
+  C: TFixedPolyCode;
+  Sect: PPESection;
+  Data: PByte;
+  Offset: Integer;
+  JmpSite: array[0..4] of Byte;
+  nWritten: NativeUInt;
+begin
+  SectSize := 0;
+  for C in FPolyCode do
+    Inc(SectSize, Length(C.CodeBytes));
+
+  if SectSize and $FFF <> 0 then
+    SectSize := (SectSize + $1000) and $FFFFF000;
+
+  Sect := PE.CreateSection('.poly', SectSize);
+  Sect.Header.Characteristics := IMAGE_SCN_CNT_CODE or IMAGE_SCN_MEM_READ or IMAGE_SCN_MEM_EXECUTE;
+  Data := AllocMem(SectSize);
+  Sect.Data := Data;
+
+  JmpSite[0] := $E9;
+  for C in FPolyCode do
+  begin
+    Move(C.CodeBytes[0], Data^, Length(C.CodeBytes));
+
+    for Offset in C.Fixups do
+      Dec(PInteger(Data + Offset)^, Sect.Header.VirtualAddress + UInt32(Offset) + 4);
+
+    PInteger(@JmpSite[1])^ := Sect.Header.VirtualAddress + UIntPtr(Data - Sect.Data) - (C.Origin - FImageBase) - 5;
+    if not WriteProcessMemory(FProcess.hProcess, Pointer(C.Origin), @JmpSite[0], 5, nWritten) then
+      RaiseLastOSError;
+
+    Inc(Data, Length(C.CodeBytes));
+  end;
 end;
 
 end.

@@ -13,7 +13,8 @@ uses
   BeaEngineDelphi32 in 'BeaEngineDelphi32.pas',
   ASProtect in 'ASProtect.pas',
   RestoreLibCode in 'RestoreLibCode.pas',
-  Patcher in 'Patcher.pas';
+  Patcher in 'Patcher.pas',
+  RolyPoly in 'RolyPoly.pas';
 
 {$R *.res}
 
