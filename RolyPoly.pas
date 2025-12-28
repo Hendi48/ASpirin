@@ -60,8 +60,9 @@ type
     CodeBytes: TBytes;
     Fixups: TList<Integer>; // List of offsets for call REL32s that need to be adjusted later.
     Origin: NativeUInt; // Where we need to put the jump into the poly section.
+    OriginalExtent: TMemoryRegion;
 
-    constructor Create;
+    constructor Create(const AOriginalExtent: TMemoryRegion);
     destructor Destroy; override;
   end;
 
@@ -72,6 +73,7 @@ type
     FProcess, FTraceThread: THandle;
     FAddress: NativeUInt; // Start address of polymorphically obfuscated function.
     FASRegion: TMemoryRegion; // Region of ASProtect DLL.
+    FOriginalExtent: TMemoryRegion;
     FCodeDump: PByte;
     FCodeSize: NativeUInt;
     FDisassembly: TDictionary<NativeUInt, PDisasm>;
@@ -215,6 +217,13 @@ begin
         else
           Continue;
 
+      // call/jmp ptr?
+      if Dis.Instruction.Opcode = $FF then
+        if Dis.Instruction.BranchType = CallType then
+          Continue
+        else
+          Exit(dsComplete);
+
       // jcc?
       FWorklist.Add(Dis.Instruction.AddrValue);
     end;
@@ -273,24 +282,40 @@ end;
 
 function TRolyPoly.Run: TFixedPolyCode;
 var
-  nRead: NativeUInt;
+  ReadAddr, PageOffset, PageBase, nRead: NativeUInt;
   BufPtr: PByte;
   Item: NativeUInt;
   OldProt: Cardinal;
   E: Pointer;
   D: PDisasm;
 begin
+  PageBase := FAddress and not $FFF;
+  PageOffset := FAddress - PageBase;
+  ReadAddr := PageBase;
+
   while True do
   begin
     Inc(FCodeSize, $1000);
     ReallocMem(FCodeDump, FCodeSize);
     BufPtr := FCodeDump + FCodeSize - $1000;
-    if not ReadProcessMemory(FProcess, Pointer(FAddress + NativeUInt(BufPtr - FCodeDump)), BufPtr, $1000, nRead) then
+    if not ReadProcessMemory(FProcess, Pointer(ReadAddr), BufPtr, $1000, nRead) then
       RaiseLastOSError;
 
-    if PUInt64(BufPtr + $1000 - 8)^ = 0 then
+    // Skip bytes before FAddress on first iteration
+    if (ReadAddr = PageBase) and (PageOffset > 0) then
+    begin
+      Move(BufPtr[PageOffset], BufPtr[0], $1000 - PageOffset);
+      Dec(FCodeSize, PageOffset);
+      ReallocMem(FCodeDump, FCodeSize);
+    end;
+
+    if (FCodeSize >= 8) and (PUInt64(FCodeDump + FCodeSize - 8)^ = 0) then
       Break;
+
+    Inc(ReadAddr, $1000);
   end;
+
+  FOriginalExtent := TMemoryRegion.Create(FAddress, FCodeSize);
 
   FWorklist.Add(FAddress);
 
@@ -326,7 +351,7 @@ begin
   CleanupCodeDump;
   ProcessNewInstrs;
 
-  Result := TFixedPolyCode.Create;
+  Result := TFixedPolyCode.Create(FOriginalExtent);
   for D in FDisassembly.Values do
     if (D^.Instruction.Opcode = $E8) and (PInteger(D^.EIP + 1)^ = -1) then
     begin
@@ -726,9 +751,10 @@ end;
 
 { TFixedPolyCode }
 
-constructor TFixedPolyCode.Create;
+constructor TFixedPolyCode.Create(const AOriginalExtent: TMemoryRegion);
 begin
   Fixups := TList<Integer>.Create;
+  OriginalExtent := AOriginalExtent;
 end;
 
 destructor TFixedPolyCode.Destroy;

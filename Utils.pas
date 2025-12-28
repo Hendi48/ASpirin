@@ -40,6 +40,7 @@ type
     Address: NativeUInt;
     Size: Cardinal;
 
+    constructor Create(AAddress: NativeUInt; ASize: Cardinal);
     function Contains(AAddress: NativeUInt): Boolean;
   end;
 
@@ -52,6 +53,12 @@ function FindStatic(const APattern: AnsiString; ABuf: PByte; ASize: Cardinal): C
 implementation
 
 { TMemoryRegion }
+
+constructor TMemoryRegion.Create(AAddress: NativeUInt; ASize: Cardinal);
+begin
+  Address := AAddress;
+  Size := ASize;
+end;
 
 function TMemoryRegion.Contains(AAddress: NativeUInt): Boolean;
 begin

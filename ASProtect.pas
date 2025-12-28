@@ -42,6 +42,8 @@ type
     function OnSinglestep(BPA: NativeUInt): Cardinal; override;
   public
     destructor Destroy; override;
+
+    function StolenRegionAlreadyProcessed(AAddress: NativeUInt): Boolean;
   end;
 
   TASTracer = class(TThread)
@@ -264,6 +266,16 @@ begin
   Result := DBG_CONTINUE;
 end;
 
+function TASDebugger.StolenRegionAlreadyProcessed(AAddress: NativeUInt): Boolean;
+var
+  C: TFixedPolyCode;
+begin
+  for C in FPolyCode do
+    if C.OriginalExtent.Contains(AAddress) then
+      Exit(True);
+  Result := False;
+end;
+
 procedure TASDebugger.FixupAPICallSites(hThread: THandle);
 begin
   InitTracing;
@@ -484,9 +496,9 @@ begin
         Log(ltInfo, Format('Stolen: PUSH at %X -> %X', [SiteAddr + 1, SiteTarget]));
       end;
 
-      if SiteTarget and $FFF <> 0 then
+      if FDebugger.StolenRegionAlreadyProcessed(SiteTarget) then
       begin
-        Log(ltInfo, '(skipping)');
+        Log(ltInfo, '(skipping, part of previous)');
         Continue;
       end;
 
