@@ -482,9 +482,21 @@ begin
   with FDisassembly[PushAddr]^ do
   begin
     Instruction.Opcode := $E8;
-    Instruction.AddrValue := CallTarget; // fixed up later
     PByte(EIP)^ := $E8;
-    PInteger(EIP + 1)^ := -1; // fixed up later
+    if CallTarget <> $FFFFFFFF then
+    begin
+      Instruction.AddrValue := CallTarget; // used later
+      PInteger(EIP + 1)^ := -1; // fixed up later
+    end
+    else // target inside stolen region
+    begin
+      CallTarget := FEntryOffsets.GetTarget2(E);
+      if CallTarget > FCodeSize then
+        raise Exception.Create('Call target out of bounds');
+      Instruction.AddrValue := FAddress + CallTarget;
+      PInteger(EIP + 1)^ := CallTarget - (Origin - 5) - 5;
+      FWorklist.Add(CallTarget + FAddress);
+    end;
   end;
   // Call becomes jmp
   with FDisassembly[PushAddr + 5]^ do

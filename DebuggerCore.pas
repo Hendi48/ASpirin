@@ -17,11 +17,15 @@ type
     function IsSet: Boolean;
   end;
 
+  TSoftBPAction = (sbpKeepContinue, sbpClearContinue);
+
   TDebuggerCore = class abstract(TThread)
   private
     FAttachPID: Cardinal;
     FHW1, FHW2, FHW3, FHW4: TBreakpoint;
     FThreads: TDictionary<Cardinal, THandle>;
+    FSoftBPs: TDictionary<Pointer, Byte>;
+    FSoftBPReenable: NativeUInt;
 
     function PEExecute: Boolean;
 
@@ -34,13 +38,14 @@ type
     function OnOutputDebugStringEvent(var DebugEv: TDebugEvent): DWORD;
     function OnRipEvent(var DebugEv: TDebugEvent): DWORD;
     function OnHardwareBreakpoint(var DebugEv: TDebugEvent): DWORD; overload;
+    function OnSoftwareBreakpoint(var DebugEv: TDebugEvent): DWORD; overload;
   protected
     procedure Execute; override;
   protected
     Log: TLogProc;
     FExecutable, FParameters: string;
     FProcess: TProcessInformation;
-    FImageBase: Cardinal;
+    FImageBase: NativeUInt;
     FMemRegions: array of TMemoryRegion;
     FHideThreadEnd: Boolean;
 
@@ -52,10 +57,14 @@ type
     procedure EnableBreakpoints;
     procedure ResetBreakpoint(Address: Pointer);
     procedure UpdateDR(hThread: THandle);
+
+    procedure SetSoftBP(Address: Pointer);
+    procedure SoftBPClear;
   protected
     procedure OnDebugStart(var hPE: THandle); virtual; abstract;
     function OnAccessViolation(hThread: THandle; const ExcRec: TExceptionRecord): Cardinal; virtual;
     procedure OnHardwareBreakpoint(hThread: THandle; BPA: NativeUInt; var C: TContext); overload; virtual; abstract;
+    function OnSoftwareBreakpoint(hThread: THandle; BPA: Pointer): TSoftBPAction; overload; virtual; abstract;
     function OnSinglestep(BPA: NativeUInt): Cardinal; virtual;
   public
     constructor Create(const AExecutable, AParameters: string; ALog: TLogProc); overload;
@@ -74,6 +83,7 @@ begin
   Log := ALog;
 
   FThreads := TDictionary<Cardinal, THandle>.Create(32);
+  FSoftBPs := TDictionary<Pointer, Byte>.Create;
 
   inherited Create(False);
 end;
@@ -84,6 +94,7 @@ begin
   Log := ALog;
 
   FThreads := TDictionary<Cardinal, THandle>.Create(32);
+  FSoftBPs := TDictionary<Pointer, Byte>.Create;
 
   inherited Create(False);
 end;
@@ -91,6 +102,7 @@ end;
 destructor TDebuggerCore.Destroy;
 begin
   FThreads.Free;
+  FSoftBPs.Free;
 
   inherited;
 end;
@@ -132,9 +144,12 @@ begin
           case Ev.Exception.ExceptionRecord.ExceptionCode of
              EXCEPTION_ACCESS_VIOLATION: Status := OnAccessViolation(FThreads[Ev.dwThreadId], Ev.Exception.ExceptionRecord);
 
-             EXCEPTION_BREAKPOINT: // First chance: Display the current instruction and register values.
+             EXCEPTION_BREAKPOINT:
              begin
-               Log(ltInfo, 'Unsolicited int3');
+               if FSoftBPs.ContainsKey(Ev.Exception.ExceptionRecord.ExceptionAddress) then
+                 Status := OnSoftwareBreakpoint(Ev)
+               else
+                 Log(ltInfo, 'Unsolicited int3');
              end;
 
              EXCEPTION_DATATYPE_MISALIGNMENT: ;
@@ -299,6 +314,8 @@ var
   C: TContext;
   BPA: Cardinal;
   Step: Boolean;
+  CC: Byte;
+  x: NativeUInt;
 begin
   Step := False;
   Result := DBG_EXCEPTION_NOT_HANDLED;
@@ -325,6 +342,14 @@ begin
 
     //Exit(DBG_CONTINUE);
     Step := True;
+  end
+  else if FSoftBPReenable <> 0 then
+  begin
+    // Re-enable soft bp after stepping over it.
+    CC := $CC;
+    WriteProcessMemory(FProcess.hProcess, Pointer(FSoftBPReenable), @CC, 1, x);
+    FSoftBPReenable := 0;
+    Exit(DBG_CONTINUE);
   end
   else
     Result := OnSinglestep(NativeUInt(EIP));
@@ -565,6 +590,82 @@ begin
   end
   else
     Log(ltFatal, 'GetThreadContext failed');
+end;
+
+function TDebuggerCore.OnSoftwareBreakpoint(var DebugEv: TDebugEvent): DWORD;
+var
+  EIP: Pointer;
+  hThread: THandle;
+  Action: TSoftBPAction;
+  C: TContext;
+  B: Byte;
+  x: NativeUInt;
+begin
+  EIP := DebugEv.Exception.ExceptionRecord.ExceptionAddress;
+  hThread := FThreads[DebugEv.dwThreadId];
+
+  C.ContextFlags := CONTEXT_CONTROL;
+  GetThreadContext(hThread, C);
+  Dec(C.Eip);
+  SetThreadContext(hThread, C);
+
+  B := FSoftBPs[EIP];
+  WriteProcessMemory(FProcess.hProcess, EIP, @B, 1, x);
+  FlushInstructionCache(FProcess.hProcess, EIP, 1);
+
+  Action := OnSoftwareBreakpoint(hThread, EIP);
+
+  if Action = sbpClearContinue then
+  begin
+    FSoftBPs.Remove(EIP);
+  end
+  else // Keep, single step
+  begin
+    FSoftBPReenable := C.Eip;
+    C.EFlags := C.EFlags or $100;
+    SetThreadContext(hThread, C);
+  end;
+
+  Result := DBG_CONTINUE;
+end;
+
+procedure TDebuggerCore.SetSoftBP(Address: Pointer);
+var
+  B: Byte;
+  x: NativeUInt;
+begin
+  if not ReadProcessMemory(FProcess.hProcess, Address, @B, 1, x) then
+    raise Exception.CreateFmt('Read for soft bp at %p failed', [Address]);
+
+  if FSoftBPs.ContainsKey(Address) then
+  begin
+    if B <> $CC then
+      Log(ltFatal, Format('Soft BP inconsistency at %p!', [Address]));
+    Exit;
+  end;
+
+  FSoftBPs.Add(Address, B);
+
+  B := $CC;
+  if not WriteProcessMemory(FProcess.hProcess, Address, @B, 1, x) then
+    raise Exception.CreateFmt('Write for soft bp at %p failed', [Address]);
+
+  FlushInstructionCache(FProcess.hProcess, Address, 1);
+end;
+
+procedure TDebuggerCore.SoftBPClear;
+var
+  BP: TPair<Pointer, Byte>;
+  B: Byte;
+  x: NativeUInt;
+begin
+  for BP in FSoftBPs do
+  begin
+    B := BP.Value;
+    WriteProcessMemory(FProcess.hProcess, BP.Key, @B, 1, x);
+    FlushInstructionCache(FProcess.hProcess, BP.Key, 1);
+  end;
+  FSoftBPs.Clear;
 end;
 
 { TBreakpoint }

@@ -8,6 +8,7 @@ type
   TASDebugger = class(TDebuggerCore)
   private
     FBaseOfData: NativeUInt;
+    FSizeOfImage: UInt32;
     FPESections: array of TImageSectionHeader;
 
     FCounter: Integer;
@@ -15,6 +16,8 @@ type
     FGuardStart, FGuardEnd: NativeUInt;
     FGuardStepping: Boolean;
     FGuardAddrs: TList<NativeUInt>;
+
+    FSiteTargetToSite: TDictionary<Pointer, Pointer>;
 
     FASRegion: TMemoryRegion; // Region to scan for proc reveal point
     FGetProcResultAddr, FProcTypeAddr: NativeUInt; // API in eax
@@ -29,8 +32,8 @@ type
 
     function IsGuardedAddress(Address: NativeUInt): Boolean;
     function ProcessGuardedAccess(hThread: THandle; const ExcRecord: TExceptionRecord): Cardinal;
+    procedure PlaceBPOnStolen(SiteAddr: NativeUInt);
 
-    procedure RestoreStolenOEPForMSVC6(hThread: THandle; var OEP: NativeUInt; IAT: NativeUInt);
     procedure FixupAPICallSites(hThread: THandle);
     procedure FinishUnpacking;
 
@@ -38,6 +41,7 @@ type
   protected
     procedure OnDebugStart(var hPE: THandle); override;
     procedure OnHardwareBreakpoint(hThread: THandle; BPA: NativeUInt; var C: TContext); override;
+    function OnSoftwareBreakpoint(hThread: THandle; BPA: Pointer): TSoftBPAction; override;
     function OnAccessViolation(hThread: THandle; const ExcRecord: TExceptionRecord): Cardinal; override;
     function OnSinglestep(BPA: NativeUInt): Cardinal; override;
   public
@@ -73,6 +77,7 @@ destructor TASDebugger.Destroy;
 begin
   FGuardAddrs.Free;
   FPolyCode.Free;
+  FSiteTargetToSite.Free;
 
   inherited;
 end;
@@ -84,6 +89,7 @@ var
   i: Integer;
   NumRead: Cardinal;
 begin
+  FSiteTargetToSite := TDictionary<Pointer, Pointer>.Create;
   FPolyCode := TObjectList<TFixedPolyCode>.Create;
 
   if (hPE = 0) or (hPE = INVALID_HANDLE_VALUE) then
@@ -109,6 +115,7 @@ begin
       FPESections[i] := Sect[i];
 
     FBaseOfData := PImageNTHeaders(Buf).OptionalHeader.BaseOfData;
+    FSizeOfImage := PImageNTHeaders(Buf).OptionalHeader.SizeOfImage;
   finally
     FreeMem(BufAlloc);
   end;
@@ -163,12 +170,72 @@ var
 begin
   if FGuardStepping then
   begin
+    // Must be here because only now the offset has been written.
+    if FGuardAddrs.Count >= 2 then
+      if FGuardAddrs.Last = FGuardAddrs[FGuardAddrs.Count - 2] + 1 then
+        PlaceBPOnStolen(FGuardAddrs.Last - 1);
+
+    // Re-apply guard.
     VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_NOACCESS, OldProt);
     FGuardStepping := False;
     Result := DBG_CONTINUE;
   end
   else
     Result := inherited;
+end;
+
+procedure TASDebugger.PlaceBPOnStolen(SiteAddr: NativeUInt);
+var
+  Site: array[0..4] of Byte;
+  SiteTarget: Cardinal;
+  mbi: TMemoryBasicInformation;
+begin
+  if not RPM(SiteAddr, @Site[0], 5) then
+    Exit;
+
+  if Site[0] = $E9 then
+    SiteTarget := PCardinal(@Site[1])^ + SiteAddr + 5
+  else if Site[0] = $68 then
+    SiteTarget := PCardinal(@Site[1])^
+  else
+    Exit;
+
+  if (SiteTarget >= FImageBase) and (SiteTarget < FImageBase + FSizeOfImage) then
+    Exit;
+  if (VirtualQueryEx(FProcess.hProcess, Pointer(SiteTarget), mbi, SizeOf(mbi)) = 0) or (mbi.State <> MEM_COMMIT) then
+    Exit;
+
+  // Set a breakpoint in case this stolen code is a stolen OEP.
+  Log(ltInfo, Format('Set soft bp on %X', [SiteTarget]));
+  SetSoftBP(Pointer(SiteTarget));
+
+  FSiteTargetToSite.Add(Pointer(SiteTarget), Pointer(SiteAddr));
+end;
+
+function TASDebugger.OnSoftwareBreakpoint(hThread: THandle; BPA: Pointer): TSoftBPAction;
+var
+  Site: Pointer;
+  OldProt: NativeUInt;
+begin
+  Result := sbpClearContinue;
+  Log(ltInfo, Format('Soft BP at 0x%p', [BPA]));
+
+  // ASProtect jumps straight to the stolen code, it doesn't execute the jmp in the text section.
+  // That's why we have to jump through these breakpoints hoops, but we can look up the text location here.
+  if not FSiteTargetToSite.TryGetValue(BPA, Site) then
+    raise Exception.Create('Address not found in dict');
+
+  SoftBPClear;
+
+  Log(ltGood, Format('OEP (stolen!): 0x%p', [Site]));
+  FOEP := NativeUInt(Site);
+
+  VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_EXECUTE_READ, OldProt);
+
+  if FGuardAddrs.Count > 0 then
+    FixupAPICallSites(hThread)
+  else
+    FinishUnpacking;
 end;
 
 function TASDebugger.OnAccessViolation(hThread: THandle; const ExcRecord: TExceptionRecord): Cardinal;
@@ -224,7 +291,6 @@ function TASDebugger.ProcessGuardedAccess(hThread: THandle; const ExcRecord: TEx
 var
   OldProt: Cardinal;
   C: TContext;
-  OEP: NativeUInt;
 begin
   Log(ltInfo, Format('[Guard] %X', [ExcRecord.ExceptionInformation[1]]));
 
@@ -249,13 +315,9 @@ begin
   else
   begin
     Log(ltGood, Format('OEP: 0x%p', [ExcRecord.ExceptionAddress]));
-
-    OEP := NativeUInt(ExcRecord.ExceptionAddress);
-    RestoreStolenOEPForMSVC6(hThread, OEP, FImageBase + FBaseOfData);
+    FOEP := NativeUInt(ExcRecord.ExceptionAddress);
 
     VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_EXECUTE_READ, OldProt);
-
-    FOEP := OEP;
 
     if FGuardAddrs.Count > 0 then
       FixupAPICallSites(hThread)
@@ -291,83 +353,6 @@ begin
   FProcRevealEvent := CreateEvent(nil, False, False, nil);
 
   TASTracer.Create(Self, hThread);
-end;
-
-procedure TASDebugger.RestoreStolenOEPForMSVC6(hThread: THandle; var OEP: NativeUInt; IAT: NativeUInt);
-const
-  RESTORE_DATA: array[0..45] of Byte = (
-    $55, $8B, $EC, $6A, $FF,
-    $68, 0, 0, 0, 0, // stru
-    $68, 0, 0, 0, 0, // except handler
-    $64, $A1, $00, $00, $00, $00, $50, $64, $89, $25, $00, $00, $00, $00,
-    $83, $EC, $58,
-    $53, $56, $57,
-    $89, $65, $E8,
-    $FF, $15, 0, 0, 0, 0, // call ds:GetVersion
-    $33, $D2
-  );
-var
-  C: TContext;
-  CheckBuf: array[0..2] of Byte;
-  IATData: array[0..511] of NativeUInt;
-  RestoreBuf: array[0..High(RESTORE_DATA)] of Byte;
-  StackData: array[0..1] of NativeUInt;
-  NumWritten: NativeUInt;
-  i: Cardinal;
-  GetVerAddr: NativeUInt;
-begin
-  RPM(OEP, @CheckBuf, 2);
-
-  // mov dl, ah
-  if (CheckBuf[0] <> $8A) or (CheckBuf[1] <> $D4) then
-    Exit;
-
-  Log(ltInfo, 'Stolen MSVC6 OEP detected.');
-
-  RPM(OEP - Cardinal(Length(RESTORE_DATA)) - 3, @CheckBuf, 3);
-  if (CheckBuf[0] <> $C2) and (CheckBuf[2] <> $C3) then
-  begin
-    Log(ltFatal, 'Stolen OEP gap mismatch.');
-    Exit;
-  end;
-
-  Move(RESTORE_DATA, RestoreBuf, Length(RestoreBuf));
-  Dec(OEP, Length(RestoreBuf));
-
-  GetVerAddr := NativeUInt(GetProcAddress(GetModuleHandle(kernel32), 'GetVersion'));
-
-  RPM(IAT, @IATData, SizeOf(IATData));
-  for i := 0 to High(IATData) do
-    if IATData[i] = GetVerAddr then
-    begin
-      PCardinal(@RestoreBuf[Length(RestoreBuf) - 6])^ := IAT + i * 4;
-      Break;
-    end;
-
-  if PCardinal(@RestoreBuf[Length(RestoreBuf) - 6])^ = 0 then
-  begin
-    Log(ltFatal, 'Unable to find GetVersion in IAT.');
-    Exit;
-  end;
-
-  C.ContextFlags := CONTEXT_INTEGER or CONTEXT_CONTROL;
-  if not GetThreadContext(hThread, C) then
-    RaiseLastOSError;
-
-  if C.Esp <> C.Ebp - $74 then
-  begin
-    Log(ltFatal, Format('Stack frame mismatch: esp=%x, ebp=%x', [C.Esp, C.Ebp]));
-    Exit;
-  end;
-
-  RPM(C.Ebp - 3 * SizeOf(NativeUInt), @StackData, SizeOf(StackData));
-
-  PCardinal(@RestoreBuf[6])^ := StackData[1];
-  PCardinal(@RestoreBuf[11])^ := StackData[0];
-
-  WriteProcessMemory(FProcess.hProcess, Pointer(OEP), @RestoreBuf, Length(RestoreBuf), NumWritten);
-
-  Log(ltGood, Format('Correct OEP: 0x%p', [Pointer(OEP)]));
 end;
 
 procedure TASDebugger.FinishUnpacking;

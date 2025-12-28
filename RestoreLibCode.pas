@@ -216,8 +216,8 @@ begin
     S := S + string(AnsiString(Dis.CompleteInstr));
   end;
 
-  Log(ltFatal, S);
-  Log(ltFatal, Format('%.2X %.2X %.2X %.2X %.2X %.2X %.2X %.2X', [CodeBuf[0], CodeBuf[1], CodeBuf[2], CodeBuf[3], CodeBuf[4], CodeBuf[5], CodeBuf[6], CodeBuf[7]]));
+  Log(ltInfo, S);
+  Log(ltInfo, Format('%.2X %.2X %.2X %.2X %.2X %.2X %.2X %.2X', [CodeBuf[0], CodeBuf[1], CodeBuf[2], CodeBuf[3], CodeBuf[4], CodeBuf[5], CodeBuf[6], CodeBuf[7]]));
   Result := nil;
 end;
 
