@@ -56,6 +56,7 @@ type
     function DisableBreakpoint(Address: Pointer): Boolean;
     procedure EnableBreakpoints;
     procedure ResetBreakpoint(Address: Pointer);
+    procedure ApplyDebugRegisters(var C: TContext);
     procedure UpdateDR(hThread: THandle);
 
     procedure SetSoftBP(Address: Pointer);
@@ -65,6 +66,7 @@ type
     function OnAccessViolation(hThread: THandle; const ExcRec: TExceptionRecord): Cardinal; virtual;
     procedure OnHardwareBreakpoint(hThread: THandle; BPA: NativeUInt; var C: TContext); overload; virtual; abstract;
     function OnSoftwareBreakpoint(hThread: THandle; BPA: Pointer): TSoftBPAction; overload; virtual; abstract;
+    procedure OnUnsolicitedSoftwareBreakpoint(hThread: THandle; BPA: Pointer); virtual;
     function OnSinglestep(BPA: NativeUInt): Cardinal; virtual;
   public
     constructor Create(const AExecutable, AParameters: string; ALog: TLogProc); overload;
@@ -149,7 +151,7 @@ begin
                if FSoftBPs.ContainsKey(Ev.Exception.ExceptionRecord.ExceptionAddress) then
                  Status := OnSoftwareBreakpoint(Ev)
                else
-                 Log(ltInfo, 'Unsolicited int3');
+                 OnUnsolicitedSoftwareBreakpoint(FThreads[Ev.dwThreadId], Ev.Exception.ExceptionRecord.ExceptionAddress);
              end;
 
              EXCEPTION_DATATYPE_MISALIGNMENT: ;
@@ -326,7 +328,7 @@ begin
   if not GetThreadContext(hThread, C) then
     Log(ltFatal, 'GetThreadContext failed');
 
-  if ((C.Dr6 shr 14) and 1) = 0 then // Bit 14: Single-step execution mode
+  if (((C.Dr6 shr 14) and 1) = 0) and (FHW1.IsSet or FHW2.IsSet or FHW3.IsSet or FHW4.IsSet) then // Bit 14: Single-step execution mode
   begin
     BPA := 0;
     case C.Dr6 and $F of
@@ -401,6 +403,11 @@ end;
 function TDebuggerCore.OnUnloadDllDebugEvent(var DebugEv: TDebugEvent): DWORD;
 begin
   Result := DBG_CONTINUE;
+end;
+
+procedure TDebuggerCore.OnUnsolicitedSoftwareBreakpoint(hThread: THandle; BPA: Pointer);
+begin
+  Log(ltInfo, 'Unsolicited int3');
 end;
 
 function TDebuggerCore.OnOutputDebugStringEvent(var DebugEv: TDebugEvent): DWORD;
@@ -550,42 +557,48 @@ begin
   Result := ReadProcessMemory(FProcess.hProcess, Pointer(Address), Buf, BufSize, BufSize);
 end;
 
+procedure TDebuggerCore.ApplyDebugRegisters(var C: TContext);
+var
+  Mask: Cardinal;
+begin
+  Mask := 0;
+
+  C.Dr0 := FHW1.Address;
+  if FHW1.IsSet then
+  begin
+    Mask := 1;
+  end;
+
+  C.Dr1 := FHW2.Address;
+  if FHW2.IsSet then
+  begin
+    Mask := Mask or (1 shl 2);
+  end;
+
+  C.Dr2 := FHW3.Address;
+  if FHW3.IsSet then
+  begin
+    Mask := Mask or (1 shl 4);
+  end;
+
+  C.Dr3 := FHW4.Address;
+  if FHW4.IsSet then
+  begin
+    Mask := Mask or (1 shl 6);
+  end;
+
+  C.Dr6 := C.Dr6 and $FFFFBFFF;
+  C.Dr7 := Mask or (UInt8(FHW1.BType) shl 16) or (UInt8(FHW2.BType) shl 20) or (UInt8(FHW3.BType) shl 24) or (UInt8(FHW4.BType) shl 28);
+end;
+
 procedure TDebuggerCore.UpdateDR(hThread: THandle);
 var
   C: TContext;
-  Mask: Cardinal;
 begin
   C.ContextFlags := CONTEXT_DEBUG_REGISTERS;
   if GetThreadContext(hThread, C) then
   begin
-    Mask := 0;
-
-    C.Dr0 := FHW1.Address;
-    if FHW1.IsSet then
-    begin
-      Mask := 1;
-    end;
-
-    C.Dr1 := FHW2.Address;
-    if FHW2.IsSet then
-    begin
-      Mask := Mask or (1 shl 2);
-    end;
-
-    C.Dr2 := FHW3.Address;
-    if FHW3.IsSet then
-    begin
-      Mask := Mask or (1 shl 4);
-    end;
-
-    C.Dr3 := FHW4.Address;
-    if FHW4.IsSet then
-    begin
-      Mask := Mask or (1 shl 6);
-    end;
-
-    C.Dr6 := C.Dr6 and $FFFFBFFF;
-    C.Dr7 := Mask or (UInt8(FHW1.BType) shl 16) or (UInt8(FHW2.BType) shl 20) or (UInt8(FHW3.BType) shl 24) or (UInt8(FHW4.BType) shl 28);
+    ApplyDebugRegisters(C);
     SetThreadContext(hThread, C);
   end
   else

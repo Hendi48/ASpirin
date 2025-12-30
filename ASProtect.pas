@@ -11,7 +11,8 @@ type
     FSizeOfImage: UInt32;
     FPESections: array of TImageSectionHeader;
 
-    FCounter: Integer;
+    FAntiDebugEH: Pointer;
+    FTextUnpackedAddr: NativeUInt;
 
     FGuardStart, FGuardEnd: NativeUInt;
     FGuardStepping: Boolean;
@@ -31,6 +32,8 @@ type
 
     FOEP: NativeUInt;
 
+    procedure GetASRegion(Address: NativeUInt);
+
     function IsGuardedAddress(Address: NativeUInt): Boolean;
     function ProcessGuardedAccess(hThread: THandle; const ExcRecord: TExceptionRecord): Cardinal;
     procedure PlaceBPOnStolen(SiteAddr: NativeUInt);
@@ -43,6 +46,7 @@ type
     procedure OnDebugStart(var hPE: THandle); override;
     procedure OnHardwareBreakpoint(hThread: THandle; BPA: NativeUInt; var C: TContext); override;
     function OnSoftwareBreakpoint(hThread: THandle; BPA: Pointer): TSoftBPAction; override;
+    procedure OnUnsolicitedSoftwareBreakpoint(hThread: THandle; BPA: Pointer); override;
     function OnAccessViolation(hThread: THandle; const ExcRecord: TExceptionRecord): Cardinal; override;
     function OnSinglestep(BPA: NativeUInt): Cardinal; override;
   public
@@ -123,8 +127,24 @@ begin
   end;
 
   FGuardAddrs := TList<NativeUInt>.Create;
+  // 1020 because 1000 has some extra code shuffling going on...
+  SetBreakpoint(FImageBase + $1020, hwWrite);
+end;
 
-  SetBreakpoint(FImageBase + $1000, hwWrite);
+procedure TASDebugger.GetASRegion(Address: NativeUInt);
+var
+  i: Integer;
+begin
+  FetchMemoryRegions;
+
+  for i := 0 to High(FMemRegions) do
+    if FMemRegions[i].Contains(Address) then
+    begin
+      FASRegion := FMemRegions[i];
+      Break;
+    end;
+
+  Log(ltGood, Format('AS region: %X~%X', [FASRegion.Address, FASRegion.Address + FASRegion.Size]));
 end;
 
 procedure TASDebugger.OnHardwareBreakpoint(hThread: THandle; BPA: NativeUInt; var C: TContext);
@@ -133,11 +153,35 @@ const
   JMP = 1;
 var
   OpTypes: array[0..1] of Byte;
+  RetAddr, OldProt: NativeUInt;
+  Instr: Word;
 begin
-  if BPA = FImageBase + $1000 then
+  if BPA = FImageBase + $1020 then
   begin
-    Log(ltGood, 'HIT FROM ' + IntToHex(C.Eip, 8));
-    Dec(FCounter);
+    Log(ltGood, 'Text accessed from ' + IntToHex(C.Eip, 8));
+    RPM(C.Eip, @Instr, 2);
+    if Instr <> $A5F3 then // rep movsd
+      Exit;
+
+    if FASRegion.Address = 0 then
+      GetASRegion(C.Eip);
+
+    // This access should be in a Move() call with two registers on the stack before ret.
+    RPM(C.Esp + 8, @RetAddr, SizeOf(RetAddr));
+    if not FASRegion.Contains(RetAddr) then
+      raise Exception.Create('Unexpected stack layout');
+    ResetBreakpoint(Pointer(BPA));
+    SetBreakpoint(RetAddr);
+    FTextUnpackedAddr := RetAddr;
+  end
+  else if BPA = FTextUnpackedAddr then
+  begin
+    ResetBreakpoint(Pointer(BPA));
+    // Unpacking .text is done - detect further accesses on it for IAT/stolen code references.
+    // Use READONLY for first hit because it still does quite a bit of reading beforehand...
+    FGuardStart := FImageBase + FPESections[0].VirtualAddress;
+    FGuardEnd := FImageBase + FBaseOfData;
+    VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_READONLY, OldProt);
   end
   else if (BPA = FGetProcResultAddr) or (BPA = FGetProcResultAddrAIP) then
   begin
@@ -223,16 +267,29 @@ begin
   Log(ltInfo, Format('Set soft bp on %X', [SiteTarget]));
   SetSoftBP(Pointer(SiteTarget));
 
-  FSiteTargetToSite.Add(Pointer(SiteTarget), Pointer(SiteAddr));
+  FSiteTargetToSite.AddOrSetValue(Pointer(SiteTarget), Pointer(SiteAddr));
 end;
 
 function TASDebugger.OnSoftwareBreakpoint(hThread: THandle; BPA: Pointer): TSoftBPAction;
 var
   Site: Pointer;
-  OldProt: NativeUInt;
+  x, CAddr: NativeUInt;
+  C: TContext;
 begin
   Result := sbpClearContinue;
   Log(ltInfo, Format('Soft BP at 0x%p', [BPA]));
+
+  if BPA = FAntiDebugEH then
+  begin
+    // eax holds a CONTEXT where DR was cleared.
+    C.ContextFlags := CONTEXT_INTEGER;
+    GetThreadContext(hThread, C);
+    CAddr := C.Eax;
+    RPM(CAddr, @C, SizeOf(C));
+    ApplyDebugRegisters(C);
+    WriteProcessMemory(FProcess.hProcess, Pointer(CAddr), @C, SizeOf(C), x);
+    Exit; // sbpClear is fine; this is actually called a second time, but we're done with hwbps by then.
+  end;
 
   // ASProtect jumps straight to the stolen code, it doesn't execute the jmp in the text section.
   // That's why we have to jump through these breakpoints hoops, but we can look up the text location here.
@@ -242,7 +299,7 @@ begin
   Log(ltGood, Format('OEP (stolen!): 0x%p', [Site]));
   FOEP := NativeUInt(Site);
 
-  VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_EXECUTE_READ, OldProt);
+  VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_EXECUTE_READ, x);
 
   if FGuardAddrs.Count > 0 then
     FixupAPICallSites(hThread)
@@ -250,10 +307,42 @@ begin
     FinishUnpacking;
 end;
 
-function TASDebugger.OnAccessViolation(hThread: THandle; const ExcRecord: TExceptionRecord): Cardinal;
+procedure TASDebugger.OnUnsolicitedSoftwareBreakpoint(hThread: THandle; BPA: Pointer);
 var
-  OldProt: Cardinal;
-  i: Integer;
+  tbi: TThreadBasicInformation;
+  SEHHead, ExcHandler: PByte;
+  nRead: NativeUInt;
+  Instr: Word;
+begin
+  inherited;
+
+  // Note: This seems to be an optional ASProtect setting, some targets don't do it.
+
+  if FASRegion.Address <> 0 then
+    Exit;
+
+  GetASRegion(NativeUInt(BPA));
+
+  // Fetch the current SEH code pointer.
+  if NtQueryInformationThread(hThread, 0 {ThreadBasicInformation}, @tbi, SizeOf(tbi), nil) <> 0 then
+    Exit;
+  if not ReadProcessMemory(FProcess.hProcess, tbi.TebBaseAddress, @SEHHead, 4, nRead) then
+    Exit;
+  if not ReadProcessMemory(FProcess.hProcess, SEHHead + 4, @ExcHandler, 4, nRead) then
+    Exit;
+
+  Log(ltInfo, Format('EH: %p', [ExcHandler]));
+
+  // This is a function that sets DRs to 0 in a CONTEXT. We set a swbp on it and restore the context.
+  if ReadProcessMemory(FProcess.hProcess, ExcHandler + $3E, @Instr, 2, nRead) then
+    if Instr = $C033 then  // xor eax, eax
+    begin
+      FAntiDebugEH := ExcHandler + $3E;
+      SetSoftBP(FAntiDebugEH);
+    end;
+end;
+
+function TASDebugger.OnAccessViolation(hThread: THandle; const ExcRecord: TExceptionRecord): Cardinal;
 begin
   if FRolyPoly <> nil then
     Exit(FRolyPoly.OnAccessViolation(hThread, ExcRecord));
@@ -262,31 +351,13 @@ begin
 
   if FGetProcResultAddr <> 0 then
   begin
+    // At this point, any exception is real (i.e., a bug).
     inherited;
     WaitForSingleObject(Handle, INFINITE);
   end;
 
   if not IsGuardedAddress(ExcRecord.ExceptionInformation[1]) then
   begin
-    Inc(FCounter);
-    if FCounter = 16 then  // FIXME this is quite the hack, some require 17
-    begin
-      FetchMemoryRegions;
-
-      for i := 0 to High(FMemRegions) do
-        if FMemRegions[i].Contains(NativeUInt(ExcRecord.ExceptionAddress)) then
-        begin
-          FASRegion := FMemRegions[i];
-          Break;
-        end;
-
-      Log(ltGood, Format('AS region: %X~%X', [FASRegion.Address, FASRegion.Address + FASRegion.Size]));
-
-      FGuardStart := FImageBase + FPESections[0].VirtualAddress;
-      FGuardEnd := FImageBase + FBaseOfData;
-      VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_NOACCESS, OldProt);
-    end;
-
     Exit(inherited);
   end;
 
@@ -315,7 +386,7 @@ begin
     FGuardAddrs.Add(ExcRecord.ExceptionInformation[1]);
 
     if FGuardAddrs.Count > 1000 then
-      raise Exception.Create('Fast-fail: Page guarding installed too early. Please try again.');
+      raise Exception.Create('Fast-fail: Something is wrong with page guarding in this target.');
 
     // Single-step, then re-protect in OnHardwareBreakpoint
     FGuardStepping := True;
