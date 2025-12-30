@@ -225,8 +225,6 @@ begin
   if not FSiteTargetToSite.TryGetValue(BPA, Site) then
     raise Exception.Create('Address not found in dict');
 
-  SoftBPClear;
-
   Log(ltGood, Format('OEP (stolen!): 0x%p', [Site]));
   FOEP := NativeUInt(Site);
 
@@ -340,6 +338,7 @@ end;
 
 procedure TASDebugger.FixupAPICallSites(hThread: THandle);
 begin
+  SoftBPClear;
   InitTracing;
 
   SuspendThread(hThread);
