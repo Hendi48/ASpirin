@@ -66,9 +66,9 @@ type
     destructor Destroy; override;
   end;
 
-  TRolyPolyState = (psInit, psTraceObfusEnter, psTraceAccessFunc, psEvalEntries);
-
   TRolyPoly = class
+  type
+    TState = (psInit, psTraceObfusEnter, psTraceAccessFunc, psEvalEntries);
   private
     FProcess, FTraceThread: THandle;
     FAddress: NativeUInt; // Start address of polymorphically obfuscated function.
@@ -80,7 +80,7 @@ type
     FWorklist: TList<NativeUInt>;
     FNewInstrs: TList<TInstrDescr>;
 
-    FState: TRolyPolyState;
+    FState: TState;
     FStateSignal: THandle;
 
     FFlowObfusSite: NativeUInt;
@@ -239,7 +239,7 @@ var
   ObjPtr, nRead: NativeUInt;
   i: Integer;
 begin
-  Log(ltInfo, 'AV at ' + IntToHex(UIntPtr(ExcRecord.ExceptionAddress)));
+  Log(ltInfo, '[Poly] AV at ' + IntToHex(UIntPtr(ExcRecord.ExceptionAddress)));
   SuspendThread(hThread);
 
   if FState = psTraceObfusEnter then

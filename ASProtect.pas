@@ -2,7 +2,7 @@ unit ASProtect;
 
 interface
 
-uses Windows, Classes, DebuggerCore, SysUtils, Generics.Collections, Utils, RolyPoly;
+uses Windows, Classes, DebuggerCore, SysUtils, Generics.Collections, Utils, RolyPoly, AIP;
 
 type
   TASDebugger = class(TDebuggerCore)
@@ -20,10 +20,11 @@ type
     FSiteTargetToSite: TDictionary<Pointer, Pointer>;
 
     FASRegion: TMemoryRegion; // Region to scan for proc reveal point
-    FGetProcResultAddr, FProcTypeAddr: NativeUInt; // API in eax
+    FGetProcResultAddr, FProcTypeAddr, FGetProcResultAddrAIP, FProcTypeAddrAIP: NativeUInt; // API in eax
     FProcRevealEvent: THandle;
     FProcAddr: Pointer;
-    FProcIsJmp: Boolean;
+    FProcIsJmp, FAIPInPlay: Boolean;
+    FAIP: TAIP;
 
     FRolyPoly: TRolyPoly;
     FPolyCode: TList<TFixedPolyCode>;
@@ -78,6 +79,7 @@ begin
   FGuardAddrs.Free;
   FPolyCode.Free;
   FSiteTargetToSite.Free;
+  FAIP.Free;
 
   inherited;
 end;
@@ -137,28 +139,40 @@ begin
     Log(ltGood, 'HIT FROM ' + IntToHex(C.Eip, 8));
     Dec(FCounter);
   end
-  else if BPA = FGetProcResultAddr then
+  else if (BPA = FGetProcResultAddr) or (BPA = FGetProcResultAddrAIP) then
   begin
     //Log(ltGood, Format('-> %X', [C.Eax]));
     FProcAddr := Pointer(C.Eax);
   end
-  else if BPA = FProcTypeAddr then
+  else if (BPA = FProcTypeAddr) or (BPA = FProcTypeAddrAIP) then
   begin
     SuspendThread(hThread);
 
-    // Many thanks to pstolarz for his extensive documentation
-    // https://github.com/pstolarz/asprext/tree/master/analysis/1.6x/aip
-    if not RPM(C.Eax + $4A, @OpTypes, 2) then
-      raise Exception.Create('RPM for env failed');
+    if BPA = FProcTypeAddr then
+    begin
+      // Many thanks to pstolarz for his extensive documentation
+      // https://github.com/pstolarz/asprext/tree/master/analysis/1.6x/aip
+      if not RPM(C.Eax + $4A, @OpTypes, 2) then
+        raise Exception.Create('RPM for env failed');
 
-    if (Byte(C.Edx) <> OpTypes[CALL]) and (Byte(C.Edx) <> OpTypes[JMP]) then
-      raise Exception.Create('Op type fault');
+      if (Byte(C.Edx) <> OpTypes[CALL]) and (Byte(C.Edx) <> OpTypes[JMP]) then
+        raise Exception.Create('Op type fault');
 
-    FProcIsJmp := Byte(C.Edx) = OpTypes[JMP];
-    if FProcIsJmp then
-      Log(ltGood, Format('-> %p, jmp', [FProcAddr]))
+      FProcIsJmp := Byte(C.Edx) = OpTypes[JMP];
+      FAIPInPlay := False;
+
+      if FProcIsJmp then
+        Log(ltGood, Format('-> %p, jmp', [FProcAddr]))
+      else
+        Log(ltGood, Format('-> %p, call', [FProcAddr]));
+    end
     else
-      Log(ltGood, Format('-> %p, call', [FProcAddr]));
+    begin
+      if FAIP = nil then
+        FAIP := TAIP.Create(FProcess.hProcess, hThread, C.Eax, Log);
+
+      FAIPInPlay := True;
+    end;
 
     SetEvent(FProcRevealEvent);
   end;
@@ -243,6 +257,8 @@ var
 begin
   if FRolyPoly <> nil then
     Exit(FRolyPoly.OnAccessViolation(hThread, ExcRecord));
+  if FAIP <> nil then
+    Exit(FAIP.OnAccessViolation(hThread, ExcRecord));
 
   if FGetProcResultAddr <> 0 then
   begin
@@ -346,6 +362,8 @@ begin
   ResetBreakpoint(Pointer(FImageBase + $1000));
   SetBreakpoint(FGetProcResultAddr);
   SetBreakpoint(FProcTypeAddr);
+  SetBreakpoint(FGetProcResultAddrAIP);
+  SetBreakpoint(FProcTypeAddrAIP);
 
   Log(ltInfo, 'Begin tracing...');
 
@@ -400,8 +418,21 @@ begin
     Inc(FProcTypeAddr, FASRegion.Address + FGetProcResultAddr + 16 + 11);
     Inc(FGetProcResultAddr, FASRegion.Address + 16);
 
+    FGetProcResultAddrAIP := FindDynamic('668B4DE08BD78B45F4E8????????8945FC', ASData, FASRegion.Size);
+    if FGetProcResultAddrAIP = 0 then
+      raise Exception.Create('Failed to find proc reveal point AIP');
+
+    FProcTypeAddrAIP := FindDynamic('8A404A3A45EF0F85', ASData + FGetProcResultAddrAIP + 14, FASRegion.Size - FGetProcResultAddrAIP - 14);
+    if FProcTypeAddrAIP = 0 then
+      raise Exception.Create('Failed to find ref type AIP');
+
+    Inc(FProcTypeAddrAIP, FASRegion.Address + FGetProcResultAddrAIP + 14);
+    Inc(FGetProcResultAddrAIP, FASRegion.Address + 14);
+
     Log(ltGood, 'GetProcResultAddr: ' + IntToHex(FGetProcResultAddr, 8));
     Log(ltGood, 'ProcTypeAddr: ' + IntToHex(FProcTypeAddr, 8));
+    Log(ltGood, 'GetProcResultAddrAIP: ' + IntToHex(FGetProcResultAddrAIP, 8));
+    Log(ltGood, 'ProcTypeAddrAIP: ' + IntToHex(FProcTypeAddrAIP, 8));
   finally
     FreeMem(ASData);
   end;
@@ -564,6 +595,9 @@ begin
   C.Esp := OldEsp;
   if not SetThreadContext(FTraceThread, C) then
     RaiseLastOSError;
+
+  if FDebugger.FAIPInPlay then
+    FDebugger.FAIP.ProcessImport(Address, FDebugger.FProcIsJmp);
 end;
 
 procedure TASTracer.Log(MsgType: TLogMsgType; const Msg: string);

@@ -125,6 +125,7 @@
         <DCCReference Include="RestoreLibCode.pas"/>
         <DCCReference Include="Patcher.pas"/>
         <DCCReference Include="RolyPoly.pas"/>
+        <DCCReference Include="AIP.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

@@ -14,7 +14,8 @@ uses
   ASProtect in 'ASProtect.pas',
   RestoreLibCode in 'RestoreLibCode.pas',
   Patcher in 'Patcher.pas',
-  RolyPoly in 'RolyPoly.pas';
+  RolyPoly in 'RolyPoly.pas',
+  AIP in 'AIP.pas';
 
 {$R *.res}
 
