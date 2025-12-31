@@ -22,6 +22,7 @@ type
 
     FASRegion: TMemoryRegion; // Region to scan for proc reveal point
     FGetProcResultAddr, FProcTypeAddr, FGetProcResultAddrAIP, FProcTypeAddrAIP: NativeUInt; // API in eax
+    FObfuscatedAIP: Boolean;
     FProcRevealEvent: THandle;
     FProcAddr: Pointer;
     FProcIsJmp, FAIPInPlay: Boolean;
@@ -185,8 +186,10 @@ begin
   end
   else if (BPA = FGetProcResultAddr) or (BPA = FGetProcResultAddrAIP) then
   begin
-    //Log(ltGood, Format('-> %X', [C.Eax]));
-    FProcAddr := Pointer(C.Eax);
+    if FObfuscatedAIP and (BPA = FGetProcResultAddrAIP) then
+      RPM(C.Ebp - 4, @FProcAddr, 4)
+    else
+      FProcAddr := Pointer(C.Eax);
   end
   else if (BPA = FProcTypeAddr) or (BPA = FProcTypeAddrAIP) then
   begin
@@ -430,7 +433,6 @@ begin
 
   SuspendThread(hThread);
 
-  ResetBreakpoint(Pointer(FImageBase + $1000));
   SetBreakpoint(FGetProcResultAddr);
   SetBreakpoint(FProcTypeAddr);
   SetBreakpoint(FGetProcResultAddrAIP);
@@ -480,25 +482,41 @@ begin
 
     FGetProcResultAddr := FindDynamic('668B4DEC668B55E88B45F4E8????????8945FC', ASData, FASRegion.Size);
     if FGetProcResultAddr = 0 then
-      raise Exception.Create('Failed to find proc reveal point');
+    begin
+      // In slightly newer versions of the protection, the call gets a pointer which will receive an obfuscated address,
+      // just for it to get deobfuscated a couple instructions down.
+      FGetProcResultAddr := FindDynamic('8945FC576A008D4D??8B45F4', ASData, FASRegion.Size);
+      if FGetProcResultAddr = 0 then
+        raise Exception.Create('Failed to find proc reveal point');
+    end
+    else
+      Inc(FGetProcResultAddr, 16);
 
-    FProcTypeAddr := FindDynamic('8BD00255??8B4DFC8B45F4', ASData + FGetProcResultAddr + 16, FASRegion.Size - FGetProcResultAddr - 16);
+    FProcTypeAddr := FindDynamic('8B4DFC8B45F4', ASData + FGetProcResultAddr, FASRegion.Size - FGetProcResultAddr);
     if FProcTypeAddr = 0 then
       raise Exception.Create('Failed to find ref type');
 
-    Inc(FProcTypeAddr, FASRegion.Address + FGetProcResultAddr + 16 + 11);
-    Inc(FGetProcResultAddr, FASRegion.Address + 16);
+    Inc(FProcTypeAddr, FASRegion.Address + FGetProcResultAddr + 6);
+    Inc(FGetProcResultAddr, FASRegion.Address);
 
     FGetProcResultAddrAIP := FindDynamic('668B4DE08BD78B45F4E8????????8945FC', ASData, FASRegion.Size);
     if FGetProcResultAddrAIP = 0 then
-      raise Exception.Create('Failed to find proc reveal point AIP');
+    begin
+      FGetProcResultAddrAIP := FindDynamic('8D45FC50668B4DE08BD78B45F4E8', ASData, FASRegion.Size);
+      if FGetProcResultAddrAIP = 0 then
+        raise Exception.Create('Failed to find proc reveal point AIP');
+      Inc(FGetProcResultAddrAIP, $12);
+      FObfuscatedAIP := True;
+    end
+    else
+      Inc(FGetProcResultAddrAIP, 14);
 
-    FProcTypeAddrAIP := FindDynamic('8A404A3A45EF0F85', ASData + FGetProcResultAddrAIP + 14, FASRegion.Size - FGetProcResultAddrAIP - 14);
+    FProcTypeAddrAIP := FindDynamic('8A404A3A45EF0F85', ASData + FGetProcResultAddrAIP, FASRegion.Size - FGetProcResultAddrAIP);
     if FProcTypeAddrAIP = 0 then
       raise Exception.Create('Failed to find ref type AIP');
 
-    Inc(FProcTypeAddrAIP, FASRegion.Address + FGetProcResultAddrAIP + 14);
-    Inc(FGetProcResultAddrAIP, FASRegion.Address + 14);
+    Inc(FProcTypeAddrAIP, FASRegion.Address + FGetProcResultAddrAIP);
+    Inc(FGetProcResultAddrAIP, FASRegion.Address);
 
     Log(ltGood, 'GetProcResultAddr: ' + IntToHex(FGetProcResultAddr, 8));
     Log(ltGood, 'ProcTypeAddr: ' + IntToHex(FProcTypeAddr, 8));
@@ -668,7 +686,7 @@ begin
     RaiseLastOSError;
 
   if FDebugger.FAIPInPlay then
-    FDebugger.FAIP.ProcessImport(Address, FDebugger.FProcIsJmp);
+    FDebugger.FAIP.ProcessImport(Address, FDebugger.FProcIsJmp, FDebugger.FProcAddr, FDebugger.FObfuscatedAIP);
 end;
 
 procedure TASTracer.Log(MsgType: TLogMsgType; const Msg: string);

@@ -95,7 +95,7 @@ type
 
     function OnAccessViolation(hThread: THandle; const ExcRecord: TExceptionRecord): Cardinal;
 
-    procedure ProcessImport(RefAddr: NativeUInt; out RefIsJmp: Boolean);
+    procedure ProcessImport(RefAddr: NativeUInt; out RefIsJmp: Boolean; var ProcAddr: Pointer; ProcAddrIsObfus: Boolean);
   end;
 
 implementation
@@ -145,7 +145,7 @@ begin
   inherited;
 end;
 
-procedure TAIP.ProcessImport(RefAddr: NativeUInt; out RefIsJmp: Boolean);
+procedure TAIP.ProcessImport(RefAddr: NativeUInt; out RefIsJmp: Boolean; var ProcAddr: Pointer; ProcAddrIsObfus: Boolean);
 var
   P: TAIPPatch;
 begin
@@ -162,6 +162,9 @@ begin
   RefIsJmp := P.IsJmp;
   if P.EmulData <> nil then
     RestoreEmulatedCode(RefAddr + 6, P.EmulData);
+
+  if ProcAddrIsObfus then
+    ProcAddr := Pointer(NativeUInt(ProcAddr) + FContext.ObfusKey);
 end;
 
 const
