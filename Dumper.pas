@@ -445,7 +445,7 @@ begin
     Move(C.CodeBytes[0], Data^, Length(C.CodeBytes));
 
     for Offset in C.Fixups do
-      Dec(PInteger(Data + Offset)^, Sect.Header.VirtualAddress + UInt32(Offset) + 4);
+      Dec(PInteger(Data + Offset)^, Sect.Header.VirtualAddress + UIntPtr(Data - Sect.Data) + UInt32(Offset) + 4);
 
     PInteger(@JmpSite[1])^ := Sect.Header.VirtualAddress + UIntPtr(Data - Sect.Data) - (C.Origin - FImageBase) - 5;
     if not WriteProcessMemory(FProcess.hProcess, Pointer(C.Origin), @JmpSite[0], 5, nWritten) then

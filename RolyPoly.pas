@@ -18,7 +18,7 @@ type
     UnkC: Pointer;
     ImageBase: Pointer;
     EntryCount: UInt32;
-    PolyCodePtr: Pointer; // Pointer to the base of the actual obfuscated code.
+    PolyCodePtr: UInt32; // Pointer to the base of the actual obfuscated code.
     FlowObfusEnterHandler: Pointer; // Code that pushes processor state and enters ASPR DLL.
     FlowObfusExitHandler: Pointer; // Code that restores processor state and returns.
     Permut: array[TASPolyHandler] of Byte;
@@ -60,9 +60,9 @@ type
     CodeBytes: TBytes;
     Fixups: TList<Integer>; // List of offsets for call REL32s that need to be adjusted later.
     Origin: NativeUInt; // Where we need to put the jump into the poly section.
-    OriginalExtent: TMemoryRegion;
+    Addresses: TList<NativeUInt>; // All addrs we've disassembled as part of this.
 
-    constructor Create(const AOriginalExtent: TMemoryRegion);
+    constructor Create(Addrs: TEnumerable<NativeUInt>);
     destructor Destroy; override;
   end;
 
@@ -72,8 +72,8 @@ type
   private
     FProcess, FTraceThread: THandle;
     FAddress: NativeUInt; // Start address of polymorphically obfuscated function.
+    FAddressDumpBase: NativeUInt;
     FASRegion: TMemoryRegion; // Region of ASProtect DLL.
-    FOriginalExtent: TMemoryRegion;
     FCodeDump: PByte;
     FCodeSize: NativeUInt;
     FDisassembly: TDictionary<NativeUInt, PDisasm>;
@@ -169,7 +169,7 @@ var
 begin
   FillChar(Dis, SizeOf(Dis), 0);
   Dis.VirtualAddr := AAddress;
-  Dis.EIP := UIntPtr(FCodeDump + AAddress - FAddress);
+  Dis.EIP := UIntPtr(FCodeDump + AAddress - FAddressDumpBase);
   Dis.Options := BeaEngineDelphi32.Tabulation;
   Dis.Archi := 32;
 
@@ -200,7 +200,7 @@ begin
       if (Dis.Instruction.Opcode = $E9) or (Dis.Instruction.Opcode = $EB) then
       begin
         Dis.VirtualAddr := Dis.Instruction.AddrValue;
-        Dis.EIP := UIntPtr(FCodeDump + Dis.Instruction.AddrValue - FAddress);
+        Dis.EIP := UIntPtr(FCodeDump + Dis.Instruction.AddrValue - FAddressDumpBase);
         if (Dis.EIP < UIntPtr(FCodeDump)) or (Dis.EIP >= UIntPtr(FCodeDump) + FCodeSize) then
           raise Exception.CreateFmt('Attempted to jump out of bounds to %X', [Dis.VirtualAddr]);
         Continue;
@@ -282,16 +282,15 @@ end;
 
 function TRolyPoly.Run: TFixedPolyCode;
 var
-  ReadAddr, PageOffset, PageBase, nRead: NativeUInt;
+  ReadAddr, nRead: NativeUInt;
   BufPtr: PByte;
   Item: NativeUInt;
   OldProt: Cardinal;
   E: Pointer;
   D: PDisasm;
 begin
-  PageBase := FAddress and not $FFF;
-  PageOffset := FAddress - PageBase;
-  ReadAddr := PageBase;
+  FAddressDumpBase := FAddress and not $FFF;
+  ReadAddr := FAddressDumpBase;
 
   while True do
   begin
@@ -301,21 +300,11 @@ begin
     if not ReadProcessMemory(FProcess, Pointer(ReadAddr), BufPtr, $1000, nRead) then
       RaiseLastOSError;
 
-    // Skip bytes before FAddress on first iteration
-    if (ReadAddr = PageBase) and (PageOffset > 0) then
-    begin
-      Move(BufPtr[PageOffset], BufPtr[0], $1000 - PageOffset);
-      Dec(FCodeSize, PageOffset);
-      ReallocMem(FCodeDump, FCodeSize);
-    end;
-
     if (FCodeSize >= 8) and (PUInt64(FCodeDump + FCodeSize - 8)^ = 0) then
       Break;
 
     Inc(ReadAddr, $1000);
   end;
-
-  FOriginalExtent := TMemoryRegion.Create(FAddress, FCodeSize);
 
   FWorklist.Add(FAddress);
 
@@ -339,7 +328,7 @@ begin
         FState := psEvalEntries;
       end;
 
-      if not FEntries.TryGetValue(FFlowObfusSite - FAddress, E) then
+      if not FEntries.TryGetValue(FFlowObfusSite - FPolyContext.PolyCodePtr, E) then
         raise Exception.CreateFmt('No entry found for site %X', [FFlowObfusSite]);
 
       ProcessFlowObfusEntry(E);
@@ -351,12 +340,12 @@ begin
   CleanupCodeDump;
   ProcessNewInstrs;
 
-  Result := TFixedPolyCode.Create(FOriginalExtent);
+  Result := TFixedPolyCode.Create(FDisassembly.Keys);
   for D in FDisassembly.Values do
     if (D^.Instruction.Opcode = $E8) and (PInteger(D^.EIP + 1)^ = -1) then
     begin
       PInteger(D^.EIP + 1)^ := D^.Instruction.AddrValue;
-      Result.Fixups.Add(D^.VirtualAddr + 1 - FAddress);
+      Result.Fixups.Add(D^.VirtualAddr + 1 - FAddressDumpBase);
     end;
   SetLength(Result.CodeBytes, FCodeSize);
   Move(FCodeDump^, Result.CodeBytes[0], FCodeSize);
@@ -469,11 +458,11 @@ begin
   Origin := FEntryOffsets.GetEntryOffset(E);
   CallTarget := FEntryOffsets.GetTarget(E);
 
-  PushAddr := FAddress + Origin - 5;
+  PushAddr := FPolyContext.PolyCodePtr + Origin - 5;
   if not FDisassembly.ContainsKey(PushAddr) or (FDisassembly[PushAddr].Instruction.Opcode <> $68) then
     raise Exception.Create('Push belonging to call not found');
 
-  CallReturn := FDisassembly[PushAddr].Instruction.Immediat - FAddress;
+  CallReturn := FDisassembly[PushAddr].Instruction.Immediat - FPolyContext.PolyCodePtr;
 
   if CallReturn > FCodeSize then
     raise Exception.CreateFmt('CallReturn seems out of bounds: %d', [CallReturn]);
@@ -493,21 +482,21 @@ begin
       CallTarget := FEntryOffsets.GetTarget2(E);
       if CallTarget > FCodeSize then
         raise Exception.Create('Call target out of bounds');
-      Instruction.AddrValue := FAddress + CallTarget;
+      Instruction.AddrValue := FPolyContext.PolyCodePtr + CallTarget;
       PInteger(EIP + 1)^ := CallTarget - (Origin - 5) - 5;
-      FWorklist.Add(CallTarget + FAddress);
+      FWorklist.Add(CallTarget + FPolyContext.PolyCodePtr);
     end;
   end;
   // Call becomes jmp
   with FDisassembly[PushAddr + 5]^ do
   begin
     Instruction.Opcode := $E9;
-    Instruction.AddrValue := CallReturn + FAddress;
+    Instruction.AddrValue := CallReturn + FPolyContext.PolyCodePtr;
     PByte(EIP)^ := $E9;
     PInteger(EIP + 1)^ := CallReturn - Origin - 5;
   end;
 
-  FWorklist.Add(CallReturn + FAddress);
+  FWorklist.Add(CallReturn + FPolyContext.PolyCodePtr);
 end;
 
 procedure TRolyPoly.RecoverJmp(E: Pointer);
@@ -521,15 +510,15 @@ begin
     raise Exception.CreateFmt('JmpTarget seems out of bounds: %d', [JmpTarget]);
 
   // Call becomes jmp
-  with FDisassembly[FAddress + Origin]^ do
+  with FDisassembly[FPolyContext.PolyCodePtr + Origin]^ do
   begin
     Instruction.Opcode := $E9;
-    Instruction.AddrValue := FAddress + JmpTarget;
+    Instruction.AddrValue := FPolyContext.PolyCodePtr + JmpTarget;
     PByte(EIP)^ := $E9;
     PInteger(EIP + 1)^ := JmpTarget - Origin - 5;
   end;
 
-  FWorklist.Add(JmpTarget + FAddress);
+  FWorklist.Add(JmpTarget + FPolyContext.PolyCodePtr);
 end;
 
 procedure TRolyPoly.RecoverJcc(E: Pointer; FromCmp: Boolean);
@@ -540,7 +529,7 @@ begin
   D1.Opcode := [$0F, $80 + FEntryOffsets.GetBranchType(E)];
   D1.AbsTarget := FEntryOffsets.GetTarget(E);
   if not FromCmp then
-    D1.Origin := FEntryOffsets.GetEntryOffset(E) + FAddress
+    D1.Origin := FEntryOffsets.GetEntryOffset(E) + FPolyContext.PolyCodePtr
   else
     D1.Origin := 0;
   // Jmp for 'false' path
@@ -551,8 +540,8 @@ begin
   FNewInstrs.Add(D1);
   FNewInstrs.Add(D2);
 
-  FWorklist.Add(D1.AbsTarget + FAddress);
-  FWorklist.Add(D2.AbsTarget + FAddress);
+  FWorklist.Add(D1.AbsTarget + FPolyContext.PolyCodePtr);
+  FWorklist.Add(D2.AbsTarget + FPolyContext.PolyCodePtr);
 end;
 
 procedure TRolyPoly.RecoverCmpJcc(E: Pointer);
@@ -613,7 +602,7 @@ begin
   end;
 
   Cmp.AbsTarget := High(UInt32);
-  Cmp.Origin := FEntryOffsets.GetEntryOffset(E) + FAddress;
+  Cmp.Origin := FEntryOffsets.GetEntryOffset(E) + FPolyContext.PolyCodePtr;
 
   FNewInstrs.Add(Cmp);
 
@@ -632,7 +621,7 @@ begin
       Highest := K;
 
   // Assemble new instructions at the end of the code block.
-  Cursor := Highest + FDisassembly[Highest].Reserved_[0] - FAddress;
+  Cursor := Highest + FDisassembly[Highest].Reserved_[0] - FAddressDumpBase;
   for Instr in FNewInstrs do
   begin
     ReqLen := Length(Instr.Opcode);
@@ -642,7 +631,8 @@ begin
     if Cursor + ReqLen > FCodeSize then
     begin
       Inc(FCodeSize, $1000);
-      ReallocMem(FCodeDump, FCodeSize);
+      //ReallocMem(FCodeDump, FCodeSize);
+      raise Exception.Create('Realloc required'); // pointers in EIP would change..
     end;
 
     if Instr.Origin <> 0 then
@@ -651,7 +641,7 @@ begin
       begin
         Instruction.Opcode := $E9;
         PByte(EIP)^ := $E9;
-        PInteger(EIP + 1)^ := Cursor - (Instr.Origin - FAddress) - 5;
+        PInteger(EIP + 1)^ := Cursor - (Instr.Origin - FAddressDumpBase) - 5;
       end;
     end;
 
@@ -660,7 +650,7 @@ begin
 
     if Instr.AbsTarget <> High(UInt32) then
     begin
-      PInteger(FCodeDump + Cursor)^ := Instr.AbsTarget - Cursor - 4;
+      PInteger(FCodeDump + Cursor)^ := (Instr.AbsTarget + FPolyContext.PolyCodePtr - FAddressDumpBase) - Cursor - 4;
       Inc(Cursor, 4);
     end;
   end;
@@ -674,13 +664,14 @@ var
   D: PDisasm;
   i: Integer;
   AllNop: Boolean;
+  NopCount: UInt32;
 begin
   // Nop trash bytes that are never executed.
   InUse := TList<Integer>.Create;
   try
     for D in FDisassembly.Values do
       for i := 0 to D^.Reserved_[0] - 1 do
-        InUse.Add(D.VirtualAddr - FAddress + UInt32(i));
+        InUse.Add(D.VirtualAddr - FAddressDumpBase + UInt32(i));
 
     for i := 0 to FCodeSize - 1 do
       if not InUse.Contains(i) then
@@ -706,6 +697,23 @@ begin
       if AllNop then
         FillChar(PByte(D^.EIP)^, D^.Reserved_[0], $90);
     end;
+  end;
+
+  // Strip nops at the beginning.
+  NopCount := 0;
+  for i := 0 to FCodeSize - 1 do
+    if FCodeDump[i] = $90 then
+      Inc(NopCount)
+    else
+      Break;
+
+  if NopCount > 0 then
+  begin
+    Move(FCodeDump[NopCount], FCodeDump[0], FCodeSize - NopCount);
+    Dec(FCodeSize, NopCount);
+    Inc(FAddressDumpBase, NopCount);
+    for D in FDisassembly.Values do
+      Dec(D^.EIP, NopCount);
   end;
 end;
 
@@ -763,15 +771,16 @@ end;
 
 { TFixedPolyCode }
 
-constructor TFixedPolyCode.Create(const AOriginalExtent: TMemoryRegion);
+constructor TFixedPolyCode.Create(Addrs: TEnumerable<NativeUInt>);
 begin
   Fixups := TList<Integer>.Create;
-  OriginalExtent := AOriginalExtent;
+  Addresses := TList<NativeUInt>.Create(Addrs);
 end;
 
 destructor TFixedPolyCode.Destroy;
 begin
   Fixups.Free;
+  Addresses.Free;
 
   inherited;
 end;

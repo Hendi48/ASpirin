@@ -421,7 +421,7 @@ var
   C: TFixedPolyCode;
 begin
   for C in FPolyCode do
-    if C.OriginalExtent.Contains(AAddress) then
+    if C.Addresses.Contains(AAddress) then
       Exit(True);
   Result := False;
 end;
