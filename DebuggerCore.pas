@@ -407,7 +407,7 @@ end;
 
 procedure TDebuggerCore.OnUnsolicitedSoftwareBreakpoint(hThread: THandle; BPA: Pointer);
 begin
-  Log(ltInfo, 'Unsolicited int3');
+  Log(ltInfo, Format('Unsolicited int3 (%p)', [BPA]));
 end;
 
 function TDebuggerCore.OnOutputDebugStringEvent(var DebugEv: TDebugEvent): DWORD;
@@ -474,6 +474,7 @@ begin
   Address := 0;
   mbi.RegionSize := $1000;
 
+  SetLength(FMemRegions, 0);
   while (VirtualQueryEx(FProcess.hProcess, Pointer(Address), mbi, SizeOf(mbi)) <> 0) and (Address + mbi.RegionSize > Address) do
   begin
     SetLength(FMemRegions, Length(FMemRegions) + 1);

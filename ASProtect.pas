@@ -2,7 +2,8 @@ unit ASProtect;
 
 interface
 
-uses Windows, Classes, DebuggerCore, SysUtils, Generics.Collections, Utils, RolyPoly, AIP;
+uses Windows, Classes, DebuggerCore, SysUtils, Generics.Collections, Utils, RolyPoly, AIP,
+     BeaEngineDelphi32;
 
 type
   TASDebugger = class(TDebuggerCore)
@@ -11,7 +12,7 @@ type
     FSizeOfImage: UInt32;
     FPESections: array of TImageSectionHeader;
 
-    FAntiDebugEH: Pointer;
+    FAntiDebugEH, FHashingDone: Pointer;
     FTextUnpackedAddr: NativeUInt;
 
     FGuardStart, FGuardEnd: NativeUInt;
@@ -35,8 +36,12 @@ type
 
     procedure GetASRegion(Address: NativeUInt);
 
+    function DisassembleExceptionHandler(AAddress: NativeUInt): TList<PDisasm>;
+
     function IsGuardedAddress(Address: NativeUInt): Boolean;
     function ProcessGuardedAccess(hThread: THandle; const ExcRecord: TExceptionRecord): Cardinal;
+    function IsSHAFunc(Address: UIntPtr): Boolean;
+    procedure SkipSHAFunc(hThread: THandle);
     procedure PlaceBPOnStolen(SiteAddr: NativeUInt);
 
     procedure FixupAPICallSites(hThread: THandle);
@@ -145,6 +150,12 @@ begin
       Break;
     end;
 
+  if FASRegion.Size < $10000 then
+  begin
+    FASRegion.Create(0, 0);
+    Exit;
+  end;
+
   Log(ltGood, Format('AS region: %X~%X', [FASRegion.Address, FASRegion.Address + FASRegion.Size]));
 end;
 
@@ -171,6 +182,7 @@ begin
     RPM(C.Esp + 8, @RetAddr, SizeOf(RetAddr));
     if not FASRegion.Contains(RetAddr) then
       raise Exception.Create('Unexpected stack layout');
+
     ResetBreakpoint(Pointer(BPA));
     SetBreakpoint(RetAddr);
     FTextUnpackedAddr := RetAddr;
@@ -179,10 +191,10 @@ begin
   begin
     ResetBreakpoint(Pointer(BPA));
     // Unpacking .text is done - detect further accesses on it for IAT/stolen code references.
-    // Use READONLY for first hit because it still does quite a bit of reading beforehand...
+    // PAGE_READONLY would save us some trouble, but it doesn't catch execution in old non-NX binaries...
     FGuardStart := FImageBase + FPESections[0].VirtualAddress;
     FGuardEnd := FImageBase + FBaseOfData;
-    VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_READONLY, OldProt);
+    VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_NOACCESS, OldProt);
   end
   else if (BPA = FGetProcResultAddr) or (BPA = FGetProcResultAddrAIP) then
   begin
@@ -291,7 +303,13 @@ begin
     RPM(CAddr, @C, SizeOf(C));
     ApplyDebugRegisters(C);
     WriteProcessMemory(FProcess.hProcess, Pointer(CAddr), @C, SizeOf(C), x);
-    Exit; // sbpClear is fine; this is actually called a second time, but we're done with hwbps by then.
+    Exit;
+  end
+  else if BPA = FHashingDone then
+  begin
+    // Re-install guard now that hash noise is gone.
+    VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_NOACCESS, x);
+    Exit;
   end;
 
   // ASProtect jumps straight to the stolen code, it doesn't execute the jmp in the text section.
@@ -310,21 +328,71 @@ begin
     FinishUnpacking;
 end;
 
+function TASDebugger.DisassembleExceptionHandler(AAddress: NativeUInt): TList<PDisasm>;
+var
+  CodeDump: array[0..$FF] of Byte;
+  Dis: TDisasm;
+  PD: PDisasm;
+  Len: Integer;
+begin
+  RPM(AAddress, @CodeDump, SizeOf(CodeDump));
+
+  Result := TList<PDisasm>.Create;
+
+  FillChar(Dis, SizeOf(Dis), 0);
+  Dis.VirtualAddr := AAddress;
+  Dis.EIP := UIntPtr(@CodeDump);
+  Dis.Options := BeaEngineDelphi32.Tabulation;
+  Dis.Archi := 32;
+
+  while Result.Count < 50 do
+  begin
+    Len := Disasm(Dis);
+    if Len = UNKNOWN_OPCODE then
+      raise Exception.CreateFmt('Disassembly ran into unknown opcode at %X', [Dis.VirtualAddr]);
+
+    New(PD);
+    PD^ := Dis;
+    Result.Add(PD);
+
+    Dis.EIP := Dis.EIP + UIntPtr(Len);
+    Dis.VirtualAddr := Dis.VirtualAddr + UIntPtr(Len);
+
+    // ret?
+    if (Dis.Instruction.Opcode = $C2) or (Dis.Instruction.Opcode = $C3) then
+      Exit;
+
+    // jmp?
+    if (Dis.Instruction.Opcode = $E9) or (Dis.Instruction.Opcode = $EB) then
+    begin
+      Dis.VirtualAddr := Dis.Instruction.AddrValue;
+      Dis.EIP := UIntPtr(@CodeDump[Dis.VirtualAddr - AAddress]);
+      if (Dis.EIP < UIntPtr(@CodeDump)) or (Dis.EIP >= UIntPtr(@CodeDump) + SizeOf(CodeDump)) then
+        raise Exception.CreateFmt('Attempted to jump out of bounds to %X', [Dis.VirtualAddr]);
+    end;
+
+    // jmp ptr?
+    if Dis.Instruction.Opcode = $FF then
+      if Dis.Instruction.BranchType <> CallType then
+        Exit;
+  end;
+end;
+
 procedure TASDebugger.OnUnsolicitedSoftwareBreakpoint(hThread: THandle; BPA: Pointer);
 var
   tbi: TThreadBasicInformation;
   SEHHead, ExcHandler: PByte;
   nRead: NativeUInt;
   Instr: Word;
+  EHDisasm: TList<PDisasm>;
+  Dis: PDisasm;
 begin
   inherited;
 
   // Note: This seems to be an optional ASProtect setting, some targets don't do it.
 
-  if FASRegion.Address <> 0 then
-    Exit;
-
-  GetASRegion(NativeUInt(BPA));
+  if FASRegion.Address = 0 then
+    GetASRegion(NativeUInt(BPA));
 
   // Fetch the current SEH code pointer.
   if NtQueryInformationThread(hThread, 0 {ThreadBasicInformation}, @tbi, SizeOf(tbi), nil) <> 0 then
@@ -336,13 +404,31 @@ begin
 
   Log(ltInfo, Format('EH: %p', [ExcHandler]));
 
-  // This is a function that sets DRs to 0 in a CONTEXT. We set a swbp on it and restore the context.
-  if ReadProcessMemory(FProcess.hProcess, ExcHandler + $3E, @Instr, 2, nRead) then
-    if Instr = $C033 then  // xor eax, eax
-    begin
-      FAntiDebugEH := ExcHandler + $3E;
+  try
+    EHDisasm := DisassembleExceptionHandler(UIntPtr(ExcHandler));
+    try
+      if EHDisasm.Count < 15 then
+        Exit;
+
+      // xor eax, eax
+      if EHDisasm[EHDisasm.Count - 3].Instruction.Opcode <> $33 then
+        Exit;
+
+      // mov [eax+10h], edx
+      if (EHDisasm[EHDisasm.Count - 4].Instruction.Opcode <> $89) or (EHDisasm[EHDisasm.Count - 4].Operand1.Memory.Displacement <> $10) then
+        Exit;
+
+      // This is a function that sets DRs to 0 in a CONTEXT. We set a swbp at its end and restore the context.
+      FAntiDebugEH := Pointer(EHDisasm[EHDisasm.Count - 3]^.VirtualAddr);
       SetSoftBP(FAntiDebugEH);
+    finally
+      for Dis in EHDisasm do
+        Dispose(Dis);
+      EHDisasm.Free;
     end;
+  except
+    Log(ltFatal, 'Error during EH analysis: ' + Exception(ExceptObject).Message);
+  end;
 end;
 
 function TASDebugger.OnAccessViolation(hThread: THandle; const ExcRecord: TExceptionRecord): Cardinal;
@@ -380,12 +466,21 @@ var
   OldProt: Cardinal;
   C: TContext;
 begin
-  Log(ltInfo, Format('[Guard] %X', [ExcRecord.ExceptionInformation[1]]));
+  Log(ltInfo, Format('[Guard] %X (from %p)', [ExcRecord.ExceptionInformation[1], ExcRecord.ExceptionAddress]));
 
   VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_EXECUTE_READWRITE, OldProt);
 
-  if NativeUInt(ExcRecord.ExceptionAddress) > FGuardEnd then
+  if UIntPtr(ExcRecord.ExceptionAddress) > FGuardEnd then
   begin
+    // If we're reading a bunch of code to checksum it, wait for that to end...
+    if ExcRecord.ExceptionInformation[1] < FGuardStart + $10 then
+      if IsSHAFunc(UIntPtr(ExcRecord.ExceptionAddress)) then
+      begin
+        Log(ltInfo, 'Guard ran into hashing, skipping...');
+        SkipSHAFunc(hThread);
+        Exit(DBG_CONTINUE);
+      end;
+
     FGuardAddrs.Add(ExcRecord.ExceptionInformation[1]);
 
     if FGuardAddrs.Count > 1000 then
@@ -403,7 +498,7 @@ begin
   else
   begin
     Log(ltGood, Format('OEP: 0x%p', [ExcRecord.ExceptionAddress]));
-    FOEP := NativeUInt(ExcRecord.ExceptionAddress);
+    FOEP := UIntPtr(ExcRecord.ExceptionAddress);
 
     VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_EXECUTE_READ, OldProt);
 
@@ -414,6 +509,41 @@ begin
   end;
 
   Result := DBG_CONTINUE;
+end;
+
+function TASDebugger.IsSHAFunc(Address: UIntPtr): Boolean;
+var
+  Code: array[0..6] of Byte;
+begin
+  RPM(Address, @Code, SizeOf(Code));
+  Result := (Code[0] = $03) and (Code[6] = $C1); // doing some adding and left-shifting
+end;
+
+procedure TASDebugger.SkipSHAFunc(hThread: THandle);
+var
+  C: TContext;
+  RetRound, RetHashing: UIntPtr;
+begin
+  C.ContextFlags := CONTEXT_CONTROL;
+  if not GetThreadContext(hThread, C) then
+    RaiseLastOSError;
+
+  RPM(C.Esp + $14, @RetRound, SizeOf(RetRound));
+  if not FASRegion.Contains(RetRound) then
+  begin
+    Log(ltFatal, 'Unknown SHA round return address ' + IntToHex(RetRound));
+    Exit;
+  end;
+
+  RPM(C.Esp + $2C, @RetHashing, SizeOf(RetHashing));
+  if not FASRegion.Contains(RetHashing) then
+  begin
+    Log(ltFatal, 'Unknown SHA return address ' + IntToHex(RetHashing));
+    Exit;
+  end;
+
+  FHashingDone := Pointer(RetHashing);
+  SetSoftBP(FHashingDone);
 end;
 
 function TASDebugger.StolenRegionAlreadyProcessed(AAddress: NativeUInt): Boolean;
