@@ -51,6 +51,7 @@ type
 
     procedure FetchMemoryRegions;
     function RPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
+    function WPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
 
     procedure SetBreakpoint(Address: NativeUInt; BType: THWBPType = hwExecute);
     function DisableBreakpoint(Address: Pointer): Boolean;
@@ -556,6 +557,11 @@ end;
 function TDebuggerCore.RPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
 begin
   Result := ReadProcessMemory(FProcess.hProcess, Pointer(Address), Buf, BufSize, BufSize);
+end;
+
+function TDebuggerCore.WPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
+begin
+  Result := WriteProcessMemory(FProcess.hProcess, Pointer(Address), Buf, BufSize, BufSize);
 end;
 
 procedure TDebuggerCore.ApplyDebugRegisters(var C: TContext);

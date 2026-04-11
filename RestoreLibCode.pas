@@ -8,13 +8,15 @@ interface
 uses SysUtils;
 
 type
-  TReadFunc = function(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean of object;
+  TReadWriteFunc = function(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean of object;
 
-function GetStolenCode(Address, Stolen: NativeUInt; RPM: TReadFunc): TBytes;
+function GetStolenCode(Address, Stolen: NativeUInt; RPM: TReadWriteFunc): TBytes;
+
+function FixUpOEPIfStolen(OEP: UIntPtr; hThread: THandle; MajorLinker, MinorLinker: Byte; RPM, WPM: TReadWriteFunc): UIntPtr;
 
 implementation
 
-uses Unit2, DebuggerCore, Utils, BeaEngineDelphi32;
+uses Unit2, Windows, DebuggerCore, Utils, BeaEngineDelphi32;
 
 const
   __EH_prolog: array[0..30] of Byte = (
@@ -78,7 +80,7 @@ begin
   Result := FuncAddr - CallVA - 5;
 end;
 
-procedure FixupWincmdln(Address: NativeUInt; var Code: TBytes; Ctx: PByte; RPM: TReadFunc);
+procedure FixupWincmdln(Address: NativeUInt; var Code: TBytes; Ctx: PByte; RPM: TReadWriteFunc);
 var
   CRT: PByte;
   CtxBase, CmdLine: NativeUInt;
@@ -103,7 +105,7 @@ begin
   end;
 end;
 
-procedure FixupSetenvp(Address: NativeUInt; var Code: TBytes; Ctx: PByte; RPM: TReadFunc);
+procedure FixupSetenvp(Address: NativeUInt; var Code: TBytes; Ctx: PByte; RPM: TReadWriteFunc);
 var
   CRT: PByte;
   CRTBase, EnvStrs, MiddleThing: NativeUInt;
@@ -147,7 +149,7 @@ begin
   end;
 end;
 
-function GetStolenCode(Address, Stolen: NativeUInt; RPM: TReadFunc): TBytes;
+function GetStolenCode(Address, Stolen: NativeUInt; RPM: TReadWriteFunc): TBytes;
 var
   Dis: TDisasm;
   CodeBuf: array[0..$330-1] of Byte;
@@ -219,6 +221,125 @@ begin
   Log(ltInfo, S);
   Log(ltInfo, Format('%.2X %.2X %.2X %.2X %.2X %.2X %.2X %.2X', [CodeBuf[0], CodeBuf[1], CodeBuf[2], CodeBuf[3], CodeBuf[4], CodeBuf[5], CodeBuf[6], CodeBuf[7]]));
   Result := nil;
+end;
+
+function RestoreOEPForMSVC6(OEP: UIntPtr; hThread: THandle; RPM, WPM: TReadWriteFunc): UIntPtr;
+const
+  RESTORE_DATA: array[0..37] of Byte = (
+    $55, $8B, $EC, $6A, $FF,
+    $68, 0, 0, 0, 0, // stru
+    $68, 0, 0, 0, 0, // except handler
+    $64, $A1, $00, $00, $00, $00, $50, $64, $89, $25, $00, $00, $00, $00,
+    $83, $EC, $58,
+    $53, $56, $57,
+    $89, $65, $E8
+  );
+var
+  C: TContext;
+  CheckBuf: array[0..2] of Byte;
+  RestoreBuf: array[0..High(RESTORE_DATA)] of Byte;
+  StackData: array[0..1] of NativeUInt;
+begin
+  RPM(OEP - Cardinal(Length(RESTORE_DATA)) - 3, @CheckBuf, 3);
+  if (CheckBuf[0] <> $C2) and (CheckBuf[2] <> $C3) then
+  begin
+    Log(ltFatal, 'Stolen OEP gap mismatch.');
+    Exit(OEP);
+  end;
+
+  Move(RESTORE_DATA, RestoreBuf, Length(RestoreBuf));
+  Result := OEP - UInt32(Length(RestoreBuf));
+
+  C.ContextFlags := CONTEXT_CONTROL;
+  if not GetThreadContext(hThread, C) then
+    RaiseLastOSError;
+
+  if C.Esp <> C.Ebp - $74 then
+  begin
+    Log(ltFatal, Format('Stack frame mismatch: esp=%x, ebp=%x', [C.Esp, C.Ebp]));
+    Exit(OEP);
+  end;
+
+  RPM(C.Ebp - 3 * SizeOf(NativeUInt), @StackData, SizeOf(StackData));
+
+  PCardinal(@RestoreBuf[6])^ := StackData[1];
+  PCardinal(@RestoreBuf[11])^ := StackData[0];
+
+  WPM(Result, @RestoreBuf, Length(RestoreBuf));
+
+  Log(ltGood, 'Stolen MSVC6 OEP restored: 0x' + IntToHex(Result));
+end;
+
+function RestoreOEPForMSVC2003(hThread: THandle; RPM, WPM: TReadWriteFunc): UIntPtr;
+var
+  C: TContext;
+  FirstPush, SecondPush, NeededSpace, Check: Cardinal;
+  Restoration: PByte;
+begin
+  C.ContextFlags := CONTEXT_CONTROL;
+  if not GetThreadContext(hThread, C) then
+    RaiseLastOSError;
+
+  FirstPush := C.Ebp - (C.Esp + $20);
+  RPM(C.Ebp - 8, @SecondPush, 4);
+
+  NeededSpace := 2 + 5;
+  if FirstPush >= $80 then
+    Inc(NeededSpace, 3);
+
+  RPM(C.Esp, @Result, 4);
+  Dec(Result, 5 + NeededSpace);
+
+  RPM(Result, @Check, 4);
+  if Check <> 0 then
+    raise Exception.CreateFmt('MSVC2003 OEP recovery failed (%X, %X, %X)', [Result, FirstPush, SecondPush]);
+
+  GetMem(Restoration, NeededSpace);
+  try
+    if FirstPush < $80 then
+    begin
+      Restoration^ := $6A;
+      (Restoration + 1)^ := FirstPush;
+      (Restoration + 2)^ := $68;
+      PCardinal(Restoration + 3)^ := SecondPush;
+    end
+    else
+    begin
+      Restoration^ := $68;
+      PCardinal(Restoration + 1)^ := FirstPush;
+      (Restoration + 5)^ := $68;
+      PCardinal(Restoration + 6)^ := SecondPush;
+    end;
+    WPM(Result, Restoration, NeededSpace);
+
+    Log(ltGood, 'Stolen MSVC2003 OEP restored: 0x' + IntToHex(Result));
+  finally
+    FreeMem(Restoration);
+  end;
+end;
+
+function FixUpOEPIfStolen(OEP: UIntPtr; hThread: THandle; MajorLinker, MinorLinker: Byte; RPM, WPM: TReadWriteFunc): UIntPtr;
+var
+  TestByte: Byte;
+begin
+  Result := OEP;
+
+  if (MajorLinker = 6) and (MinorLinker = 0) then
+  begin
+    RPM(OEP, @TestByte, 1);
+    if TestByte <> $FF then
+      Exit;
+
+    Result := RestoreOEPForMSVC6(OEP, hThread, RPM, WPM);
+  end
+  else if (MajorLinker = 7) and (MinorLinker = 10) then
+  begin
+    RPM(OEP, @TestByte, 1);
+    if TestByte <> $C3 then
+      Exit;
+
+    Result := RestoreOEPForMSVC2003(hThread, RPM, WPM);
+  end;
 end;
 
 end.

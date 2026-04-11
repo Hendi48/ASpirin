@@ -10,10 +10,11 @@ type
   private
     FBaseOfData: NativeUInt;
     FSizeOfImage: UInt32;
+    FMajorLinker, FMinorLinker: Byte;
     FPESections: array of TImageSectionHeader;
 
     FAntiDebugEH, FHashingDone: Pointer;
-    FTextUnpackedAddr: NativeUInt;
+    FSectionsUnpackedAddr: NativeUInt;
 
     FGuardStart, FGuardEnd: NativeUInt;
     FGuardStepping: Boolean;
@@ -23,6 +24,7 @@ type
 
     FASRegion: TMemoryRegion; // Region to scan for proc reveal point
     FGetProcResultAddr, FProcTypeAddr, FGetProcResultAddrAIP, FProcTypeAddrAIP: NativeUInt; // API in eax
+    FIATWrapperCall: NativeUInt;
     FObfuscatedAIP: Boolean;
     FProcRevealEvent: THandle;
     FProcAddr: Pointer;
@@ -48,6 +50,8 @@ type
     procedure FinishUnpacking;
 
     procedure InitTracing;
+    procedure FindIATWrapperCall;
+    procedure FixRedirectedImports(ArrayPtr: UIntPtr);
   protected
     procedure OnDebugStart(var hPE: THandle); override;
     procedure OnHardwareBreakpoint(hThread: THandle; BPA: NativeUInt; var C: TContext); override;
@@ -126,6 +130,8 @@ begin
     for i := 0 to High(FPESections) do
       FPESections[i] := Sect[i];
 
+    FMajorLinker := PImageNTHeaders(Buf).OptionalHeader.MajorLinkerVersion;
+    FMinorLinker := PImageNTHeaders(Buf).OptionalHeader.MinorLinkerVersion;
     FBaseOfData := PImageNTHeaders(Buf).OptionalHeader.BaseOfData;
     FSizeOfImage := PImageNTHeaders(Buf).OptionalHeader.SizeOfImage;
   finally
@@ -157,6 +163,7 @@ begin
   end;
 
   Log(ltGood, Format('AS region: %X~%X', [FASRegion.Address, FASRegion.Address + FASRegion.Size]));
+  FindIATWrapperCall;
 end;
 
 procedure TASDebugger.OnHardwareBreakpoint(hThread: THandle; BPA: NativeUInt; var C: TContext);
@@ -164,7 +171,7 @@ const
   CALL = 0;
   JMP = 1;
 var
-  OpTypes: array[0..1] of Byte;
+  OpTypes, JumpAbove: array[0..1] of Byte;
   RetAddr, OldProt: NativeUInt;
   Instr: Word;
 begin
@@ -179,18 +186,27 @@ begin
       GetASRegion(C.Eip);
 
     // This access should be in a Move() call with two registers on the stack before ret.
-    RPM(C.Esp + 8, @RetAddr, SizeOf(RetAddr));
+    RPM(C.Esp + 8, @RetAddr, SizeOf(RetAddr)); // return from Move
     if not FASRegion.Contains(RetAddr) then
       raise Exception.Create('Unexpected stack layout');
+    RPM(C.Esp + 12, @RetAddr, SizeOf(RetAddr)); // return from CopyMemory
+    if not FASRegion.Contains(RetAddr) then
+      raise Exception.Create('Unexpected stack layout (2)');
+
+    RPM(RetAddr + 18, @JumpAbove, 2);
+    if JumpAbove[0] = $77 then
+      RetAddr := RetAddr + 20
+    else if (JumpAbove[0] = $0F) and (JumpAbove[1] = $87) then
+      RetAddr := RetAddr + 24;
 
     ResetBreakpoint(Pointer(BPA));
     SetBreakpoint(RetAddr);
-    FTextUnpackedAddr := RetAddr;
+    FSectionsUnpackedAddr := RetAddr;
   end
-  else if BPA = FTextUnpackedAddr then
+  else if BPA = FSectionsUnpackedAddr then
   begin
     ResetBreakpoint(Pointer(BPA));
-    // Unpacking .text is done - detect further accesses on it for IAT/stolen code references.
+    // Unpacking is done - detect further accesses on it for IAT/stolen code references.
     // PAGE_READONLY would save us some trouble, but it doesn't catch execution in old non-NX binaries...
     FGuardStart := FImageBase + FPESections[0].VirtualAddress;
     FGuardEnd := FImageBase + FBaseOfData;
@@ -234,6 +250,10 @@ begin
     end;
 
     SetEvent(FProcRevealEvent);
+  end
+  else if BPA = FIATWrapperCall then
+  begin
+    Inc(C.Eip, 5); // Skip it!
   end;
 end;
 
@@ -383,7 +403,6 @@ var
   tbi: TThreadBasicInformation;
   SEHHead, ExcHandler: PByte;
   nRead: NativeUInt;
-  Instr: Word;
   EHDisasm: TList<PDisasm>;
   Dis: PDisasm;
 begin
@@ -499,6 +518,7 @@ begin
   begin
     Log(ltGood, Format('OEP: 0x%p', [ExcRecord.ExceptionAddress]));
     FOEP := UIntPtr(ExcRecord.ExceptionAddress);
+    FOEP := FixUpOEPIfStolen(FOEP, hThread, FMajorLinker, FMinorLinker, RPM, WPM);
 
     VirtualProtectEx(FProcess.hProcess, Pointer(FGuardStart), FGuardEnd - FGuardStart, PAGE_EXECUTE_READ, OldProt);
 
@@ -587,11 +607,12 @@ begin
     Free;
   end;
 
-  with TPatcher.Create(FN) do
-  begin
-    Process;
-    Free;
-  end;
+  if FMajorLinker = 6 then
+    with TPatcher.Create(FN) do
+    begin
+      Process;
+      Free;
+    end;
 
   FHideThreadEnd := True;
   TerminateProcess(FProcess.hProcess, 0);
@@ -655,6 +676,106 @@ begin
   finally
     FreeMem(ASData);
   end;
+end;
+
+procedure TASDebugger.FindIATWrapperCall;
+var
+  ASMem: PByte;
+  Calls, Push, GPASet, x: Cardinal;
+begin
+  // This is for some ASProtect versions that don't use AIP/SIP.
+  GetMem(ASMem, FASRegion.Size);
+  try
+    RPM(FASRegion.Address, ASMem, FASRegion.Size);
+    // First call resolves the proc, second would put it in a wrapper -> we skip the second call.
+    Calls := FindDynamic('50E8????????E8????????8B178902', ASMem, FASRegion.Size);
+    if Calls = 0 then
+      Exit;
+
+    FIATWrapperCall := FASRegion.Address + Calls + 6;
+    Log(ltGood, 'IAT wrapper call located at ' + IntToHex(FIATWrapperCall));
+    SetBreakpoint(FIATWrapperCall);  // use hwbp instead of code patching due to checksumming
+
+    // Patch redirected GetProcAddress pointer with real one.
+    GPASet := FindDynamic('B8????????8B17890283', ASMem + Calls, 200);
+    if GPASet <> 0 then
+    begin
+      GPASet := FASRegion.Address + Calls + GPASet + 1;
+      Log(ltGood, 'Patching GPA at ' + IntToHex(GPASet));
+      Push := Cardinal(GetProcAddress(GetModuleHandle(kernel32), 'GetProcAddress'));
+      if not WriteProcessMemory(FProcess.hProcess, Pointer(GPASet), @Push, 4, x) then
+        RaiseLastOSError;
+    end
+    else
+      Log(ltFatal, 'GPA pattern not found');
+
+    // pusha; push ARRAY; lea eax, [ebp-?]; push dword ptr
+    Push := FindDynamic('6068????????8D45??FF35', ASMem, FASRegion.Size);
+    if Push = 0 then
+    begin
+      Log(ltFatal, 'Pattern for api redirects not found');
+      Exit;
+    end;
+
+    FixRedirectedImports(PCardinal(ASMem + Push + 2)^);
+  finally
+    FreeMem(ASMem);
+  end;
+end;
+
+procedure TASDebugger.FixRedirectedImports(ArrayPtr: UIntPtr);
+const
+  REAL_METHODS: array[0..10] of AnsiString = (
+    'GetCommandLineA',
+    'GetVersion',
+    '', // 1 arg, returns 1 in al
+    'GetModuleHandleA',
+    'GetCurrentProcess',
+    'GetCurrentProcessId',
+    'LockResource',
+    'FreeResource',
+    '', // 2 args
+    'DialogBoxParamA', // user32
+    ''  // 0 args, returns dword
+  );
+var
+  Methods: array[0..10] of Cardinal;
+  Canary, x: Cardinal;
+  i: Integer;
+  Module: HMODULE;
+begin
+  // Validate that the method table size is as expected.
+  RPM(ArrayPtr, @Methods, SizeOf(Methods));
+  for i := 0 to High(Methods) do
+    if not FASRegion.Contains(Methods[i]) then
+    begin
+      Log(ltFatal, Format('FixRedirectedImports: Index %d not a valid pointer', [i]));
+      Exit;
+    end;
+
+  RPM(ArrayPtr + SizeOf(Methods), @Canary, 4);
+  if FASRegion.Contains(Canary) then
+  begin
+    // There COULD be something unrelated after the array that happens to be a valid pointer, but oh well...
+    Log(ltFatal, 'FixRedirectedImports: Canary check failed');
+    Exit;
+  end;
+
+  for i := 0 to High(Methods) do
+  begin
+    if REAL_METHODS[i] = '' then
+      Continue;
+
+    if REAL_METHODS[i] <> 'DialogBoxParamA' then
+      Module := GetModuleHandle(kernel32)
+    else
+      Module := GetModuleHandle(user32);
+
+    Methods[i] := Cardinal(GetProcAddress(Module, PAnsiChar(REAL_METHODS[i])));
+  end;
+
+  if not WriteProcessMemory(FProcess.hProcess, Pointer(ArrayPtr), @Methods, SizeOf(Methods), x) then
+    RaiseLastOSError;
 end;
 
 { TASTracer }

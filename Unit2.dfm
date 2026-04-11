@@ -37,7 +37,7 @@ object UnpackerWnd: TUnpackerWnd
     ViewStyle = vsReport
   end
   object OD: TOpenDialog
-    Filter = 'Application|*.exe|Nexshit|*.aes'
+    Filter = 'Application|*.exe|Any file|*.*'
     Options = [ofHideReadOnly, ofFileMustExist, ofEnableSizing]
     Left = 120
     Top = 32
